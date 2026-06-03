@@ -2,7 +2,7 @@
 
 A local macOS terminal prototype that continuously captures audio from an input device, detects speech segments, transcribes completed speech with `faster-whisper`, and saves the transcript to text and JSONL files.
 
-This is an early prototype for a future live translation and vocabulary-learning desktop app. It currently does live transcription, finalized-line translation, selective word hints, speaker labels, and file saving.
+This is an early prototype for a future live translation and vocabulary-learning desktop app. It currently does live transcription, finalized-line translation, selective word hints, speaker labels, local LLM meeting minutes, and file saving.
 
 ## Why not Docker for macOS audio capture?
 
@@ -17,7 +17,7 @@ chmod +x setup.sh
 ./setup.sh
 ```
 
-The script can install system dependencies, create a virtual environment, install Python packages, optionally install BlackHole 2ch, optionally pre-download a Whisper model, and help you list or test audio devices.
+The script can install system dependencies, create a virtual environment, install Python packages, optionally install BlackHole 2ch, optionally install the German spaCy model, optionally build a local German-English dictionary, optionally pre-download a Whisper model, and help you list or test audio devices.
 
 ## Manual installation
 
@@ -76,13 +76,22 @@ Translate finalized lines to English with Whisper:
 venv/bin/python app.py --model base --language de --full-translation
 ```
 
-Add selective English word hints for useful German nouns and verbs:
+Add selective English word hints for German nouns and verbs:
 
 ```bash
 venv/bin/python app.py --model base --language de --selective-translation
 ```
 
-Full translation applies only to finalized transcript lines. Selective noun/verb hints can also appear on live partial lines because they use the lightweight built-in glossary.
+By default, finalized-line word hints use local Ollama with `llama3.1:latest` to identify and translate many more nouns and verbs. If Ollama is unavailable, the app falls back to the fast local dictionary backend. Use `--selective-translation-backend dictionary` for dictionary-only mode or `--selective-translation-backend built_in_glossary` for the smallest fallback mode.
+
+Full translation applies only to finalized transcript lines. Live partial lines use the fast dictionary backend so noun/verb hints can appear without waiting for Ollama.
+
+For the best live partial word hints, install the German spaCy model and build the optional local FreeDict SQLite dictionary:
+
+```bash
+venv/bin/python -m spacy download de_core_news_sm
+venv/bin/python scripts/build_dictionary.py
+```
 
 Enable anonymous speaker labels on finalized lines with:
 
@@ -106,9 +115,25 @@ Install the Python requirements, then launch the PySide6 app:
 venv/bin/python ui_app.py
 ```
 
-The UI uses the same transcription engine as the CLI. It defaults to BlackHole 2ch when that input is visible, `base` model, German language, saved transcripts, 2-second provisional partials, full English translation, and selective word hints.
+The UI uses the same transcription engine as the CLI. It defaults to BlackHole 2ch when that input is visible, `base` model, German language, saved transcripts, 2-second provisional partials, full English translation, dictionary-backed live partial word hints, and Ollama-backed selective word hints for finalized transcript lines.
 
 Selective word hints appear directly above the German nouns and verbs inside finalized and live partial transcript lines. The right-side vocabulary panel accumulates new words from finalized lines with English meanings, so provisional mis-hearings do not become study words.
+
+The middle Minutes panel uses local Ollama with `llama3.1:latest` to update English meeting minutes after every 3 finalized transcript lines. It does not summarize partial lines. Install the model with:
+
+```bash
+ollama pull llama3.1
+```
+
+If Ollama is not already running, start it with:
+
+```bash
+ollama serve
+```
+
+The UI is tab-based. Use `New` for a fresh transcript, `Open` to continue a saved one, `Save` or `Save As` to write a `.trans` file, `Rename` to rename the tab and saved file, and `Close Tab` to close the current transcript. A `.trans` file is JSON and stores the transcript events, minutes panel, vocabulary panel, tab title, splitter size, and scroll positions.
+
+Vocabulary nouns include their German article when known, for example `die Zaehne` or `das Wasser`.
 
 Speaker labels can be enabled from the UI. Use the reset button if the app learns poor speaker profiles during the current listening session.
 

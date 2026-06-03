@@ -269,6 +269,18 @@ info "Installing Python packages"
 venv/bin/python -m pip install --upgrade pip
 venv/bin/python -m pip install -r requirements.txt
 
+if confirm "Install the German spaCy model for fast live noun/verb word hints? [Y/n]" "Y"; then
+  venv/bin/python -m spacy download de_core_news_sm
+else
+  warn "Skipping German spaCy model. Live partial word hints will use the smaller seeded dictionary."
+fi
+
+if confirm "Download/build the local German-English FreeDict dictionary for broader live word hints? This downloads about 429 MB. [y/N]" "N"; then
+  venv/bin/python scripts/build_dictionary.py
+else
+  warn "Skipping local dictionary build. You can run later: venv/bin/python scripts/build_dictionary.py"
+fi
+
 if confirm "Do you want to download a Whisper model now? [y/N]" "N"; then
   MODEL_NAME="$(choose_model)"
   MODEL_NAME="$MODEL_NAME" venv/bin/python - <<'PY'

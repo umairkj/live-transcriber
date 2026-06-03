@@ -28,7 +28,11 @@ from live_transcriber.config import (
 )
 from live_transcriber.device_utils import DeviceInfo, get_input_devices
 from live_transcriber.speakers import DEFAULT_SPEAKER_BACKEND, SPEAKER_BACKENDS, SpeakerLabeler
-from live_transcriber.translations import DEFAULT_TRANSLATION_TARGET_LANGUAGE
+from live_transcriber.translations import (
+    DEFAULT_SELECTIVE_TRANSLATION_BACKEND,
+    DEFAULT_TRANSLATION_TARGET_LANGUAGE,
+    SELECTIVE_TRANSLATION_BACKENDS,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -71,6 +75,7 @@ class LiveTranscriberConfig:
     speaker_backend: str = DEFAULT_SPEAKER_BACKEND
     full_translation: bool = False
     selective_translation: bool = False
+    selective_translation_backend: str = DEFAULT_SELECTIVE_TRANSLATION_BACKEND
     translation_target_language: str = DEFAULT_TRANSLATION_TARGET_LANGUAGE
 
 
@@ -292,15 +297,16 @@ class LiveTranscriberSession:
                             record["translation_backend"] = "whisper"
 
                     if config.selective_translation:
-                        from live_transcriber.translations import build_selective_translations
+                        from live_transcriber.translations import build_selective_translation_result
 
-                        selective_translations = build_selective_translations(
+                        selective_translations, selective_translation_backend = build_selective_translation_result(
                             text,
                             target_language=config.translation_target_language,
+                            backend=config.selective_translation_backend,
                         )
                         if selective_translations:
                             record["selective_translations"] = selective_translations
-                            record["selective_translation_backend"] = "built_in_glossary"
+                            record["selective_translation_backend"] = selective_translation_backend
 
                     display_text = format_speaker_text(text, record.get("speaker_label"))
                     if callbacks.on_final_text is not None:
@@ -426,6 +432,11 @@ class LiveTranscriberSession:
             raise ValueError(f"speaker_backend must be one of: {', '.join(SPEAKER_BACKENDS)}")
         if config.translation_target_language != "en":
             raise ValueError("translation_target_language must be 'en'")
+        if config.selective_translation_backend not in SELECTIVE_TRANSLATION_BACKENDS:
+            raise ValueError(
+                "selective_translation_backend must be one of: "
+                f"{', '.join(SELECTIVE_TRANSLATION_BACKENDS)}"
+            )
 
     def _ensure_device(self, device_id: int | None) -> None:
         devices = self._device_provider()

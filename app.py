@@ -24,7 +24,7 @@ from live_transcriber.config import (
 )
 from live_transcriber.session import LiveTranscriberCallbacks, LiveTranscriberConfig, LiveTranscriberSession
 from live_transcriber.speakers import DEFAULT_SPEAKER_BACKEND, SPEAKER_BACKENDS
-from live_transcriber.translations import DEFAULT_TRANSLATION_TARGET_LANGUAGE
+from live_transcriber.translations import SELECTIVE_TRANSLATION_BACKENDS, DEFAULT_TRANSLATION_TARGET_LANGUAGE
 
 
 logger = logging.getLogger(__name__)
@@ -148,6 +148,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="Add English word hints for selected nouns, verbs, and other useful words on finalized lines.",
     )
     parser.add_argument(
+        "--selective-translation-backend",
+        choices=SELECTIVE_TRANSLATION_BACKENDS,
+        default="ollama",
+        help="Word-hint backend for --selective-translation. Default: ollama",
+    )
+    parser.add_argument(
         "--translation-target",
         default=DEFAULT_TRANSLATION_TARGET_LANGUAGE,
         choices=[DEFAULT_TRANSLATION_TARGET_LANGUAGE],
@@ -207,6 +213,11 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError(f"--speaker-backend must be one of: {', '.join(SPEAKER_BACKENDS)}")
     if args.translation_target != DEFAULT_TRANSLATION_TARGET_LANGUAGE:
         raise ValueError("--translation-target must be en")
+    if args.selective_translation_backend not in SELECTIVE_TRANSLATION_BACKENDS:
+        raise ValueError(
+            "--selective-translation-backend must be one of: "
+            f"{', '.join(SELECTIVE_TRANSLATION_BACKENDS)}"
+        )
 
 
 def run(args: argparse.Namespace) -> int:
@@ -253,6 +264,7 @@ def run(args: argparse.Namespace) -> int:
         speaker_backend=args.speaker_backend,
         full_translation=args.full_translation,
         selective_translation=args.selective_translation,
+        selective_translation_backend=args.selective_translation_backend,
         translation_target_language=args.translation_target,
     )
 

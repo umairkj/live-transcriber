@@ -2,6 +2,7 @@ faster-whisper
 sounddevice
 numpy
 PySide6
+spacy
 
 # Optional speaker labels:
 # speechbrain

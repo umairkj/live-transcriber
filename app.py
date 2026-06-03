@@ -24,6 +24,7 @@ from live_transcriber.config import (
 )
 from live_transcriber.session import LiveTranscriberCallbacks, LiveTranscriberConfig, LiveTranscriberSession
 from live_transcriber.speakers import DEFAULT_SPEAKER_BACKEND, SPEAKER_BACKENDS
+from live_transcriber.translations import DEFAULT_TRANSLATION_TARGET_LANGUAGE
 
 
 logger = logging.getLogger(__name__)
@@ -136,6 +137,22 @@ def build_parser() -> argparse.ArgumentParser:
         default=DEFAULT_SPEAKER_BACKEND,
         help=f"Speaker-labeling backend. Default: {DEFAULT_SPEAKER_BACKEND}",
     )
+    parser.add_argument(
+        "--full-translation",
+        action="store_true",
+        help="Translate finalized speech segments to English with Whisper. Partials are not translated.",
+    )
+    parser.add_argument(
+        "--selective-translation",
+        action="store_true",
+        help="Add English word hints for selected nouns, verbs, and other useful words on finalized lines.",
+    )
+    parser.add_argument(
+        "--translation-target",
+        default=DEFAULT_TRANSLATION_TARGET_LANGUAGE,
+        choices=[DEFAULT_TRANSLATION_TARGET_LANGUAGE],
+        help=f"Translation target language. Default: {DEFAULT_TRANSLATION_TARGET_LANGUAGE}",
+    )
     parser.add_argument("--verbose", action="store_true", help="Enable verbose logging.")
     parser.add_argument("--no-jsonl", action="store_true", help="Do not write JSONL transcript records.")
     parser.add_argument(
@@ -188,6 +205,8 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--beam-size must be greater than 0")
     if args.speaker_backend not in SPEAKER_BACKENDS:
         raise ValueError(f"--speaker-backend must be one of: {', '.join(SPEAKER_BACKENDS)}")
+    if args.translation_target != DEFAULT_TRANSLATION_TARGET_LANGUAGE:
+        raise ValueError("--translation-target must be en")
 
 
 def run(args: argparse.Namespace) -> int:
@@ -232,6 +251,9 @@ def run(args: argparse.Namespace) -> int:
         beam_size=args.beam_size,
         speaker_labels=args.speaker_labels,
         speaker_backend=args.speaker_backend,
+        full_translation=args.full_translation,
+        selective_translation=args.selective_translation,
+        translation_target_language=args.translation_target,
     )
 
     def on_status(message: str) -> None:
@@ -247,10 +269,22 @@ def run(args: argparse.Namespace) -> int:
         elif message != "Stopped":
             print(message, flush=True)
 
+    def on_final_text(text: str, record: dict) -> None:
+        print(text, flush=True)
+        translation_text = record.get("translation_text")
+        if translation_text:
+            print(f"    EN: {translation_text}", flush=True)
+        selective_translations = record.get("selective_translations") or []
+        if selective_translations:
+            hints = ", ".join(
+                f"{item.get('source')}={item.get('translation')}" for item in selective_translations[:10]
+            )
+            print(f"    words: {hints}", flush=True)
+
     callbacks = LiveTranscriberCallbacks(
         on_status=on_status,
         on_partial_text=lambda text: print(f"[partial] {text}", flush=True),
-        on_final_text=lambda text, record: print(text, flush=True),
+        on_final_text=on_final_text,
         on_error=lambda message: logger.error("%s", message),
     )
 

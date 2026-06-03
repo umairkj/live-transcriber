@@ -46,6 +46,15 @@ class FakeTranscriber:
             "segments": [],
         }
 
+    def translate(self, audio: np.ndarray, sample_rate: int) -> dict[str, Any]:
+        del audio, sample_rate
+        return {
+            "text": "I brush teeth",
+            "language": "en",
+            "language_probability": 1.0,
+            "segments": [],
+        }
+
 
 class FakeWriter:
     def __init__(self) -> None:
@@ -255,6 +264,46 @@ def test_speaker_backend_failure_does_not_stop_transcription() -> None:
     assert any("Speaker labels disabled" in error for error in errors)
 
 
+def test_final_translation_metadata_is_added_to_records() -> None:
+    recorder = FakeRecorder([frame(0.1), frame(0.1), frame(0.1), frame(0.0), frame(0.0)])
+    writer = FakeWriter()
+    session = LiveTranscriberSession(
+        recorder_factory=lambda config: recorder,
+        transcriber_factory=lambda config: FakeTranscriber(),
+        writer_factory=lambda config: writer,
+        device_provider=lambda: [DeviceInfo(0, "BlackHole 2ch", 2, 48000.0)],
+    )
+    finals: list[dict[str, Any]] = []
+
+    config = LiveTranscriberConfig(
+        device=0,
+        save_transcript=True,
+        sample_rate=1000,
+        pause_seconds=0.2,
+        pre_roll_seconds=0.0,
+        min_speech_seconds=0.1,
+        min_segment_seconds=0.1,
+        partial_seconds=0,
+        full_translation=True,
+        selective_translation=True,
+    )
+    callbacks = LiveTranscriberCallbacks(on_final_text=lambda text, record: finals.append(record))
+
+    session.start(config, callbacks)
+    deadline = time.time() + 2
+    while not finals and time.time() < deadline:
+        time.sleep(0.01)
+    session.stop()
+    session.join(2)
+
+    assert len(writer.records) == 1
+    assert writer.records[0]["translation_text"] == "I brush teeth"
+    assert writer.records[0]["translation_target_language"] == "en"
+    assert writer.records[0]["translation_backend"] == "whisper"
+    assert writer.records[0]["selective_translations"]
+    assert any(item["source"] == "putze" for item in writer.records[0]["selective_translations"])
+
+
 def test_device_list_adapter() -> None:
     session = LiveTranscriberSession(device_provider=lambda: [DeviceInfo(7, "Example Mic", 1, 44100.0)])
     devices = session.list_devices()
@@ -266,6 +315,7 @@ def main() -> None:
     test_session_saves_final_records_when_enabled()
     test_speaker_labeler_adds_display_prefix_and_record_metadata()
     test_speaker_backend_failure_does_not_stop_transcription()
+    test_final_translation_metadata_is_added_to_records()
     test_device_list_adapter()
     print("session controller tests passed")
 

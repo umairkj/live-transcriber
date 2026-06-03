@@ -52,4 +52,7 @@ class TranscriptWriter:
         if speaker_label:
             text = f"{speaker_label}: {text}"
         self.write_text(text, metadata=record)
+        translation_text = record.get("translation_text")
+        if translation_text:
+            self.write_text(f"EN: {translation_text}", metadata=record)
         self.write_jsonl(record)

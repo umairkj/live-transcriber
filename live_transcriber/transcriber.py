@@ -43,6 +43,12 @@ class FasterWhisperTranscriber:
             ) from exc
 
     def transcribe(self, audio: np.ndarray, sample_rate: int) -> dict[str, Any]:
+        return self._process_audio(audio, sample_rate, task="transcribe")
+
+    def translate(self, audio: np.ndarray, sample_rate: int) -> dict[str, Any]:
+        return self._process_audio(audio, sample_rate, task="translate")
+
+    def _process_audio(self, audio: np.ndarray, sample_rate: int, task: str) -> dict[str, Any]:
         audio = np.asarray(audio, dtype=np.float32).reshape(-1)
         if audio.size == 0:
             return {
@@ -54,22 +60,23 @@ class FasterWhisperTranscriber:
 
         if sample_rate == 16000:
             try:
-                return self._transcribe_source(audio)
+                return self._transcribe_source(audio, task=task)
             except Exception as exc:
                 logger.warning("Direct numpy transcription failed; retrying with temporary WAV: %s", exc)
 
         wav_path = self._write_temp_wav(audio, sample_rate)
         try:
-            return self._transcribe_source(str(wav_path))
+            return self._transcribe_source(str(wav_path), task=task)
         except Exception as exc:
-            raise RuntimeError(f"Could not transcribe speech segment: {exc}") from exc
+            raise RuntimeError(f"Could not process speech segment: {exc}") from exc
         finally:
             wav_path.unlink(missing_ok=True)
 
-    def _transcribe_source(self, source: str | np.ndarray) -> dict[str, Any]:
+    def _transcribe_source(self, source: str | np.ndarray, task: str) -> dict[str, Any]:
         segments_iter, info = self.model.transcribe(
             source,
             language=self.language,
+            task=task,
             beam_size=self.beam_size,
             temperature=0.0,
             condition_on_previous_text=False,

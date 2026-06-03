@@ -28,6 +28,7 @@ from live_transcriber.config import (
 )
 from live_transcriber.device_utils import DeviceInfo, get_input_devices
 from live_transcriber.speakers import DEFAULT_SPEAKER_BACKEND, SPEAKER_BACKENDS, SpeakerLabeler
+from live_transcriber.translations import DEFAULT_TRANSLATION_TARGET_LANGUAGE
 
 
 logger = logging.getLogger(__name__)
@@ -41,6 +42,7 @@ class Recorder(Protocol):
 
 class Transcriber(Protocol):
     def transcribe(self, audio, sample_rate: int) -> dict[str, Any]: ...  # noqa: ANN001
+    def translate(self, audio, sample_rate: int) -> dict[str, Any]: ...  # noqa: ANN001
 
 
 @dataclass(frozen=True)
@@ -67,6 +69,9 @@ class LiveTranscriberConfig:
     beam_size: int = DEFAULT_BEAM_SIZE
     speaker_labels: bool = False
     speaker_backend: str = DEFAULT_SPEAKER_BACKEND
+    full_translation: bool = False
+    selective_translation: bool = False
+    translation_target_language: str = DEFAULT_TRANSLATION_TARGET_LANGUAGE
 
 
 @dataclass(frozen=True)
@@ -187,8 +192,11 @@ class LiveTranscriberSession:
         jobs = TranscriptionJobQueue()
         deduper = RecentTextDeduper()
         partial_tracker = PartialTextTracker()
+        full_translation_enabled = config.full_translation
 
         def transcribe_jobs() -> None:
+            nonlocal full_translation_enabled
+
             while True:
                 job = jobs.get()
                 try:
@@ -268,6 +276,31 @@ class LiveTranscriberSession:
                             record["speaker_label"] = speaker_info.speaker_label
                             record["speaker_confidence"] = speaker_info.confidence
                             record["speaker_backend"] = speaker_info.backend
+
+                    if full_translation_enabled:
+                        translation_text = self._translate_final(
+                            callbacks=callbacks,
+                            transcriber=transcriber,
+                            audio=job.audio,
+                            sample_rate=config.sample_rate,
+                        )
+                        if translation_text is None:
+                            full_translation_enabled = False
+                        elif translation_text:
+                            record["translation_text"] = translation_text
+                            record["translation_target_language"] = config.translation_target_language
+                            record["translation_backend"] = "whisper"
+
+                    if config.selective_translation:
+                        from live_transcriber.translations import build_selective_translations
+
+                        selective_translations = build_selective_translations(
+                            text,
+                            target_language=config.translation_target_language,
+                        )
+                        if selective_translations:
+                            record["selective_translations"] = selective_translations
+                            record["selective_translation_backend"] = "built_in_glossary"
 
                     display_text = format_speaker_text(text, record.get("speaker_label"))
                     if callbacks.on_final_text is not None:
@@ -391,6 +424,8 @@ class LiveTranscriberSession:
             raise ValueError("beam_size must be greater than 0")
         if config.speaker_backend.casefold() not in SPEAKER_BACKENDS:
             raise ValueError(f"speaker_backend must be one of: {', '.join(SPEAKER_BACKENDS)}")
+        if config.translation_target_language != "en":
+            raise ValueError("translation_target_language must be 'en'")
 
     def _ensure_device(self, device_id: int | None) -> None:
         devices = self._device_provider()
@@ -452,6 +487,23 @@ class LiveTranscriberSession:
                 self._speaker_labeler = None
                 self._error(callbacks, f"Speaker labels disabled: {exc}")
                 return None
+
+    def _translate_final(
+        self,
+        callbacks: LiveTranscriberCallbacks,
+        transcriber: Transcriber,
+        audio,  # noqa: ANN001
+        sample_rate: int,
+    ) -> str | None:
+        try:
+            result = transcriber.translate(audio, sample_rate=sample_rate)
+        except Exception as exc:  # noqa: BLE001
+            self._error(callbacks, f"Full translation disabled: {exc}")
+            return None
+
+        from live_transcriber.text_cleanup import cleanup_transcript_text
+
+        return cleanup_transcript_text(str(result.get("text", "")))
 
     def _status(self, callbacks: LiveTranscriberCallbacks, message: str) -> None:
         if callbacks.on_status is not None:

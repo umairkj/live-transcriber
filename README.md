@@ -2,7 +2,7 @@
 
 A local macOS terminal prototype that continuously captures audio from an input device, detects speech segments, transcribes completed speech with `faster-whisper`, and saves the transcript to text and JSONL files.
 
-This is an early prototype for a future live translation and vocabulary-learning desktop app. For now, it only does live transcription and file saving. Translation and vocabulary extraction are intentionally left as local placeholders.
+This is an early prototype for a future live translation and vocabulary-learning desktop app. It currently does live transcription, finalized-line translation, selective word hints, speaker labels, and file saving.
 
 ## Why not Docker for macOS audio capture?
 
@@ -70,6 +70,20 @@ Disable provisional output with:
 venv/bin/python app.py --model base --language de --partial-seconds 0
 ```
 
+Translate finalized lines to English with Whisper:
+
+```bash
+venv/bin/python app.py --model base --language de --full-translation
+```
+
+Add selective English word hints for useful German nouns and verbs:
+
+```bash
+venv/bin/python app.py --model base --language de --selective-translation
+```
+
+Full translation applies only to finalized transcript lines. Selective noun/verb hints can also appear on live partial lines because they use the lightweight built-in glossary.
+
 Enable anonymous speaker labels on finalized lines with:
 
 ```bash
@@ -92,7 +106,9 @@ Install the Python requirements, then launch the PySide6 app:
 venv/bin/python ui_app.py
 ```
 
-The UI uses the same transcription engine as the CLI. It defaults to BlackHole 2ch when that input is visible, `base` model, German language, saved transcripts, and 2-second provisional partials.
+The UI uses the same transcription engine as the CLI. It defaults to BlackHole 2ch when that input is visible, `base` model, German language, saved transcripts, 2-second provisional partials, full English translation, and selective word hints.
+
+Selective word hints appear directly above the German nouns and verbs inside finalized and live partial transcript lines. The right-side vocabulary panel accumulates new words from finalized lines with English meanings, so provisional mis-hearings do not become study words.
 
 Speaker labels can be enabled from the UI. Use the reset button if the app learns poor speaker profiles during the current listening session.
 

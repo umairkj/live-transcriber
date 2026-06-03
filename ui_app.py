@@ -168,6 +168,8 @@ class MainWindow(QMainWindow):
         options_grid.addWidget(self.speaker_backend_combo, 2, 3)
 
         timing_form = QFormLayout()
+        timing_form.setHorizontalSpacing(10)
+        timing_form.setVerticalSpacing(6)
         self.partial_seconds_spin = QDoubleSpinBox()
         self.partial_seconds_spin.setRange(0.0, 10.0)
         self.partial_seconds_spin.setSingleStep(0.25)
@@ -188,7 +190,17 @@ class MainWindow(QMainWindow):
         self.transcript.setReadOnly(True)
         self.transcript.setPlaceholderText("Transcript appears here when listening starts.")
         self.transcript.setStyleSheet(
-            "QTextEdit { font-size: 15px; line-height: 1.35; background: #fbfbfb; border: 1px solid #d7d7d7; }"
+            """
+            QTextEdit {
+                font-size: 15px;
+                line-height: 1.4;
+                background: #f4f6f7;
+                border: 1px solid #cfd6da;
+                border-radius: 8px;
+                padding: 10px;
+                selection-background-color: #b9d7ff;
+            }
+            """
         )
         layout.addWidget(self.transcript, stretch=1)
 
@@ -280,8 +292,17 @@ class MainWindow(QMainWindow):
         if not self.show_partials_check.isChecked():
             return
         self._append_html(
-            f'<p style="margin: 6px 0; color: #707070;"><span style="font-weight: 600;">partial</span> '
-            f"{html.escape(text)}</p>"
+            '<table width="100%" cellspacing="0" cellpadding="0" style="margin: 6px 0 8px 0;">'
+            "<tr>"
+            '<td width="24%"></td>'
+            '<td style="background-color: #e6f2ff; border: 1px solid #a8cfee; padding: 8px 10px;">'
+            '<span style="color: #2f6f9f; font-size: 11px; font-weight: 700; letter-spacing: 0;">live</span>'
+            '<span style="color: #2e5268;"> '
+            f"{html.escape(text)}"
+            "</span>"
+            "</td>"
+            "</tr>"
+            "</table>"
         )
 
     @Slot(str, object)
@@ -289,17 +310,46 @@ class MainWindow(QMainWindow):
         record_data = record if isinstance(record, dict) else {}
         raw_text = str(record_data.get("text") or text)
         speaker_label = record_data.get("speaker_label")
-        margin_top = "4px" if speaker_label and speaker_label == self._last_final_speaker else "10px"
+        timestamp = str(record_data.get("timestamp") or "")
+        margin_top = "3px" if speaker_label and speaker_label == self._last_final_speaker else "10px"
         self._last_final_speaker = str(speaker_label) if speaker_label else None
 
         if speaker_label:
-            prefix = f'<span style="font-weight: 800; color: #111111;">{html.escape(str(speaker_label))}:</span>'
+            marker = (
+                '<td width="34" align="center" valign="top" '
+                'style="background-color: #1f4d3a; color: #ffffff; font-size: 14px; '
+                'font-weight: 800; padding: 8px 6px;">'
+                f"{html.escape(str(speaker_label))}:"
+                "</td>"
+            )
         else:
-            prefix = '<span style="font-weight: 700;">final</span>'
+            marker = (
+                '<td width="6" style="background-color: #3f5f6f; padding: 0;">'
+                "&nbsp;"
+                "</td>"
+            )
+
+        timestamp_html = ""
+        if timestamp:
+            timestamp_html = (
+                '<div style="color: #8a969c; font-size: 11px; margin-bottom: 3px;">'
+                f"{html.escape(timestamp)}"
+                "</div>"
+            )
 
         self._append_html(
-            f'<p style="margin: {margin_top} 0 8px 0; color: #111111;">{prefix} '
-            f"{html.escape(raw_text)}</p>"
+            f'<table width="100%" cellspacing="0" cellpadding="0" style="margin: {margin_top} 0 8px 0;">'
+            "<tr>"
+            f"{marker}"
+            '<td style="background-color: #ffffff; border: 1px solid #d8dee2; '
+            'border-left: 0; padding: 8px 10px;">'
+            f"{timestamp_html}"
+            '<div style="color: #111820; font-size: 15px; line-height: 1.45;">'
+            f"{html.escape(raw_text)}"
+            "</div>"
+            "</td>"
+            "</tr>"
+            "</table>"
         )
 
     @Slot(int)

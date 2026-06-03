@@ -45,7 +45,7 @@ def main() -> None:
     window.append_partial("ich putze")
     window.append_final("A: Ich putze die Zaehne.", {"text": "Ich putze die Zaehne.", "speaker_label": "A"})
     rendered = window.transcript.toHtml()
-    assert "partial" in rendered
+    assert "live" in rendered
     assert "A:" in rendered
     assert "Ich putze die Zaehne." in rendered
 

@@ -47,5 +47,9 @@ class TranscriptWriter:
     def write_record(self, record: dict[str, Any]) -> None:
         record = dict(record)
         record.setdefault("timestamp", datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
-        self.write_text(str(record.get("text", "")), metadata=record)
+        text = str(record.get("text", ""))
+        speaker_label = record.get("speaker_label")
+        if speaker_label:
+            text = f"{speaker_label}: {text}"
+        self.write_text(text, metadata=record)
         self.write_jsonl(record)

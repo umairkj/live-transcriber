@@ -2,3 +2,8 @@ faster-whisper
 sounddevice
 numpy
 PySide6
+
+# Optional speaker labels:
+# speechbrain
+# torch
+# torchaudio

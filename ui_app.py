@@ -15,6 +15,7 @@ from live_transcriber.config import (
 )
 from live_transcriber.device_utils import DeviceInfo, get_input_devices
 from live_transcriber.session import LiveTranscriberCallbacks, LiveTranscriberConfig, LiveTranscriberSession
+from live_transcriber.speakers import DEFAULT_SPEAKER_BACKEND, SPEAKER_BACKENDS
 
 try:
     from PySide6.QtCore import QObject, QThread, Qt, Signal, Slot
@@ -74,6 +75,11 @@ class TranscriptionWorker(QObject):
         if self._session is not None:
             self._session.stop()
 
+    @Slot()
+    def reset_speakers(self) -> None:
+        if self._session is not None:
+            self._session.reset_speakers()
+
 
 class MainWindow(QMainWindow):
     stop_requested = Signal()
@@ -86,10 +92,12 @@ class MainWindow(QMainWindow):
         self._thread: QThread | None = None
         self._worker: TranscriptionWorker | None = None
         self._is_running = False
+        self._last_final_speaker: str | None = None
 
         self._build_ui()
         self.refresh_devices()
         self._set_running(False)
+        self._update_speaker_controls()
 
     def _build_ui(self) -> None:
         root = QWidget()
@@ -144,6 +152,21 @@ class MainWindow(QMainWindow):
         options_grid.addWidget(self.clear_on_start_check, 1, 2)
         options_grid.addWidget(self.always_on_top_check, 1, 3)
 
+        self.speaker_labels_check = QCheckBox("Speaker labels")
+        self.speaker_labels_check.toggled.connect(self._update_speaker_controls)
+        options_grid.addWidget(self.speaker_labels_check, 2, 0)
+
+        self.reset_speakers_button = QPushButton("Reset speakers")
+        self.reset_speakers_button.clicked.connect(self.reset_speakers)
+        options_grid.addWidget(self.reset_speakers_button, 2, 1)
+
+        self.speaker_backend_label = QLabel("Speaker backend")
+        self.speaker_backend_combo = QComboBox()
+        self.speaker_backend_combo.addItems(SPEAKER_BACKENDS)
+        self.speaker_backend_combo.setCurrentText(DEFAULT_SPEAKER_BACKEND)
+        options_grid.addWidget(self.speaker_backend_label, 2, 2)
+        options_grid.addWidget(self.speaker_backend_combo, 2, 3)
+
         timing_form = QFormLayout()
         self.partial_seconds_spin = QDoubleSpinBox()
         self.partial_seconds_spin.setRange(0.0, 10.0)
@@ -158,7 +181,7 @@ class MainWindow(QMainWindow):
         self.pause_seconds_spin.setDecimals(2)
         self.pause_seconds_spin.setValue(DEFAULT_PAUSE_SECONDS)
         timing_form.addRow("Pause seconds", self.pause_seconds_spin)
-        options_grid.addLayout(timing_form, 2, 0, 1, 4)
+        options_grid.addLayout(timing_form, 3, 0, 1, 4)
         layout.addLayout(options_grid)
 
         self.transcript = QTextEdit()
@@ -216,7 +239,9 @@ class MainWindow(QMainWindow):
 
     def start_transcription(self) -> None:
         config = self._build_config()
-        self.transcript.clear()
+        if self.clear_on_start_check.isChecked():
+            self.transcript.clear()
+            self._last_final_speaker = None
         self.output_label.setText(str(config.text_path or "Transcript saving disabled"))
 
         self._thread = QThread(self)
@@ -261,9 +286,20 @@ class MainWindow(QMainWindow):
 
     @Slot(str, object)
     def append_final(self, text: str, record: object | None = None) -> None:
+        record_data = record if isinstance(record, dict) else {}
+        raw_text = str(record_data.get("text") or text)
+        speaker_label = record_data.get("speaker_label")
+        margin_top = "4px" if speaker_label and speaker_label == self._last_final_speaker else "10px"
+        self._last_final_speaker = str(speaker_label) if speaker_label else None
+
+        if speaker_label:
+            prefix = f'<span style="font-weight: 800; color: #111111;">{html.escape(str(speaker_label))}:</span>'
+        else:
+            prefix = '<span style="font-weight: 700;">final</span>'
+
         self._append_html(
-            f'<p style="margin: 9px 0; color: #111111;"><span style="font-weight: 700;">final</span> '
-            f"{html.escape(text)}</p>"
+            f'<p style="margin: {margin_top} 0 8px 0; color: #111111;">{prefix} '
+            f"{html.escape(raw_text)}</p>"
         )
 
     @Slot(int)
@@ -282,6 +318,14 @@ class MainWindow(QMainWindow):
     def set_always_on_top(self, enabled: bool) -> None:
         self.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint, enabled)
         self.show()
+
+    @Slot()
+    def reset_speakers(self) -> None:
+        if self._worker is not None:
+            self._worker.reset_speakers()
+            self.set_status("Speaker profiles reset")
+        else:
+            self.set_status("No active speaker profiles")
 
     def closeEvent(self, event) -> None:  # noqa: ANN001
         if self._is_running:
@@ -312,6 +356,8 @@ class MainWindow(QMainWindow):
             pause_seconds=self.pause_seconds_spin.value(),
             partial_seconds=partial_seconds,
             beam_size=DEFAULT_BEAM_SIZE,
+            speaker_labels=self.speaker_labels_check.isChecked(),
+            speaker_backend=self.speaker_backend_combo.currentText(),
         )
 
     def _set_running(self, is_running: bool) -> None:
@@ -332,10 +378,21 @@ class MainWindow(QMainWindow):
             self.show_partials_check,
             self.save_transcript_check,
             self.clear_on_start_check,
+            self.speaker_labels_check,
+            self.speaker_backend_combo,
             self.partial_seconds_spin,
             self.pause_seconds_spin,
         ):
             widget.setEnabled(not is_running)
+        self.reset_speakers_button.setEnabled(self.speaker_labels_check.isChecked())
+
+    @Slot(bool)
+    def _update_speaker_controls(self, checked: bool | None = None) -> None:
+        del checked
+        enabled = self.speaker_labels_check.isChecked()
+        self.speaker_backend_label.setVisible(enabled)
+        self.speaker_backend_combo.setVisible(enabled)
+        self.reset_speakers_button.setEnabled(enabled)
 
     def _append_html(self, value: str) -> None:
         cursor = self.transcript.textCursor()

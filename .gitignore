@@ -18,6 +18,7 @@ transcripts/*
 # Whisper/Hugging Face caches when stored in the project
 .cache/
 models/
+pretrained_models/
 
 # macOS and editor files
 .DS_Store

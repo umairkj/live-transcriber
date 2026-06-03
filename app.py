@@ -23,6 +23,7 @@ from live_transcriber.config import (
     DEFAULT_SILENCE_THRESHOLD,
 )
 from live_transcriber.session import LiveTranscriberCallbacks, LiveTranscriberConfig, LiveTranscriberSession
+from live_transcriber.speakers import DEFAULT_SPEAKER_BACKEND, SPEAKER_BACKENDS
 
 
 logger = logging.getLogger(__name__)
@@ -124,6 +125,17 @@ def build_parser() -> argparse.ArgumentParser:
         default=DEFAULT_BEAM_SIZE,
         help=f"Whisper beam size. Lower is faster. Default: {DEFAULT_BEAM_SIZE}",
     )
+    parser.add_argument(
+        "--speaker-labels",
+        action="store_true",
+        help="Label finalized transcript lines with anonymous speaker IDs like A: and B:. Partials stay unlabeled.",
+    )
+    parser.add_argument(
+        "--speaker-backend",
+        choices=SPEAKER_BACKENDS,
+        default=DEFAULT_SPEAKER_BACKEND,
+        help=f"Speaker-labeling backend. Default: {DEFAULT_SPEAKER_BACKEND}",
+    )
     parser.add_argument("--verbose", action="store_true", help="Enable verbose logging.")
     parser.add_argument("--no-jsonl", action="store_true", help="Do not write JSONL transcript records.")
     parser.add_argument(
@@ -174,6 +186,8 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--min-text-length must be 0 or greater")
     if args.beam_size <= 0:
         raise ValueError("--beam-size must be greater than 0")
+    if args.speaker_backend not in SPEAKER_BACKENDS:
+        raise ValueError(f"--speaker-backend must be one of: {', '.join(SPEAKER_BACKENDS)}")
 
 
 def run(args: argparse.Namespace) -> int:
@@ -216,6 +230,8 @@ def run(args: argparse.Namespace) -> int:
         compute_type=args.compute_type,
         device_type=args.device_type,
         beam_size=args.beam_size,
+        speaker_labels=args.speaker_labels,
+        speaker_backend=args.speaker_backend,
     )
 
     def on_status(message: str) -> None:

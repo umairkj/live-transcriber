@@ -5,7 +5,7 @@ import time
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from threading import Event, Thread
+from threading import Event, Lock, Thread
 from typing import Any, Callable, Protocol
 
 from live_transcriber.config import (
@@ -27,6 +27,7 @@ from live_transcriber.config import (
     DEFAULT_SILENCE_THRESHOLD,
 )
 from live_transcriber.device_utils import DeviceInfo, get_input_devices
+from live_transcriber.speakers import DEFAULT_SPEAKER_BACKEND, SPEAKER_BACKENDS, SpeakerLabeler
 
 
 logger = logging.getLogger(__name__)
@@ -64,6 +65,8 @@ class LiveTranscriberConfig:
     compute_type: str = DEFAULT_COMPUTE_TYPE
     device_type: str = DEFAULT_DEVICE_TYPE
     beam_size: int = DEFAULT_BEAM_SIZE
+    speaker_labels: bool = False
+    speaker_backend: str = DEFAULT_SPEAKER_BACKEND
 
 
 @dataclass(frozen=True)
@@ -82,13 +85,17 @@ class LiveTranscriberSession:
         recorder_factory: Callable[[LiveTranscriberConfig], Recorder] | None = None,
         transcriber_factory: Callable[[LiveTranscriberConfig], Transcriber] | None = None,
         writer_factory: Callable[[LiveTranscriberConfig], Any] | None = None,
+        speaker_labeler_factory: Callable[[LiveTranscriberConfig], SpeakerLabeler | None] | None = None,
         device_provider: Callable[[], list[DeviceInfo]] = get_input_devices,
     ) -> None:
         self._recorder_factory = recorder_factory or self._default_recorder
         self._transcriber_factory = transcriber_factory or self._default_transcriber
         self._writer_factory = writer_factory or self._default_writer
+        self._speaker_labeler_factory = speaker_labeler_factory or self._default_speaker_labeler
         self._device_provider = device_provider
         self._stop_event = Event()
+        self._speaker_lock = Lock()
+        self._speaker_labeler: SpeakerLabeler | None = None
         self._thread: Thread | None = None
 
     def list_devices(self) -> list[DeviceInfo]:
@@ -113,6 +120,11 @@ class LiveTranscriberSession:
     def join(self, timeout: float | None = None) -> None:
         if self._thread is not None:
             self._thread.join(timeout=timeout)
+
+    def reset_speakers(self) -> None:
+        with self._speaker_lock:
+            if self._speaker_labeler is not None:
+                self._speaker_labeler.reset()
 
     def run_blocking(
         self,
@@ -144,10 +156,22 @@ class LiveTranscriberSession:
             self._error(callbacks, str(exc))
             return 1
 
+        speaker_labeler = None
+        if config.speaker_labels:
+            try:
+                speaker_labeler = self._speaker_labeler_factory(config)
+            except (RuntimeError, ValueError) as exc:
+                self._error(callbacks, f"Speaker labels disabled: {exc}")
+                speaker_labeler = None
+
+        with self._speaker_lock:
+            self._speaker_labeler = speaker_labeler
+
         from live_transcriber.deduper import RecentTextDeduper
         from live_transcriber.jobs import TranscriptionJob, TranscriptionJobQueue
         from live_transcriber.partials import PartialTextTracker
         from live_transcriber.segmentation import SpeechSegmenter
+        from live_transcriber.speakers import SpeakerInfo, format_speaker_text
         from live_transcriber.text_cleanup import cleanup_transcript_text, is_garbage_fragment
 
         recorder = self._recorder_factory(config)
@@ -227,9 +251,27 @@ class LiveTranscriberSession:
                         "beam_size": config.beam_size,
                         "segments": result.get("segments", []),
                     }
+                    if config.speaker_labels:
+                        record["speaker_label"] = None
+                        record["speaker_confidence"] = None
+                        record["speaker_backend"] = config.speaker_backend
 
+                    speaker_info: SpeakerInfo | None = None
+                    if config.speaker_labels:
+                        speaker_info = self._label_speaker(
+                            callbacks=callbacks,
+                            audio=job.audio,
+                            sample_rate=config.sample_rate,
+                            utterance_id=job.utterance_id,
+                        )
+                        if speaker_info is not None:
+                            record["speaker_label"] = speaker_info.speaker_label
+                            record["speaker_confidence"] = speaker_info.confidence
+                            record["speaker_backend"] = speaker_info.backend
+
+                    display_text = format_speaker_text(text, record.get("speaker_label"))
                     if callbacks.on_final_text is not None:
-                        callbacks.on_final_text(text, record)
+                        callbacks.on_final_text(display_text, record)
                     if writer is not None:
                         try:
                             writer.write_record(record)
@@ -318,6 +360,8 @@ class LiveTranscriberSession:
                 enqueue_final(final_segment)
             jobs.put_stop()
             worker.join()
+            with self._speaker_lock:
+                self._speaker_labeler = None
             self._status(callbacks, "Stopped")
 
         return exit_code
@@ -345,6 +389,8 @@ class LiveTranscriberSession:
             raise ValueError("min_text_length must be 0 or greater")
         if config.beam_size <= 0:
             raise ValueError("beam_size must be greater than 0")
+        if config.speaker_backend.casefold() not in SPEAKER_BACKENDS:
+            raise ValueError(f"speaker_backend must be one of: {', '.join(SPEAKER_BACKENDS)}")
 
     def _ensure_device(self, device_id: int | None) -> None:
         devices = self._device_provider()
@@ -384,6 +430,28 @@ class LiveTranscriberSession:
             jsonl_path=config.jsonl_path,
             overwrite=config.overwrite,
         )
+
+    def _default_speaker_labeler(self, config: LiveTranscriberConfig) -> SpeakerLabeler | None:
+        from live_transcriber.speakers import create_speaker_labeler
+
+        return create_speaker_labeler(config)
+
+    def _label_speaker(
+        self,
+        callbacks: LiveTranscriberCallbacks,
+        audio,  # noqa: ANN001
+        sample_rate: int,
+        utterance_id: int,
+    ):
+        with self._speaker_lock:
+            if self._speaker_labeler is None:
+                return None
+            try:
+                return self._speaker_labeler.label(audio, sample_rate=sample_rate, utterance_id=utterance_id)
+            except Exception as exc:  # noqa: BLE001
+                self._speaker_labeler = None
+                self._error(callbacks, f"Speaker labels disabled: {exc}")
+                return None
 
     def _status(self, callbacks: LiveTranscriberCallbacks, message: str) -> None:
         if callbacks.on_status is not None:

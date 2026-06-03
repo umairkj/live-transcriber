@@ -70,6 +70,20 @@ Disable provisional output with:
 venv/bin/python app.py --model base --language de --partial-seconds 0
 ```
 
+Enable anonymous speaker labels on finalized lines with:
+
+```bash
+venv/bin/python app.py --model base --language de --speaker-labels
+```
+
+Speaker labels are optional and best-effort. The local backend uses SpeechBrain ECAPA speaker embeddings if the optional speaker packages are installed:
+
+```bash
+venv/bin/python -m pip install speechbrain torch torchaudio
+```
+
+When enabled, final terminal and text transcript lines are prefixed with labels like `A:` or `B:`. Partial lines remain unlabeled, and JSONL records keep raw text plus `speaker_label`, `speaker_confidence`, and `speaker_backend` fields. The `pyannote` backend is reserved for a later advanced implementation.
+
 ## Run the macOS desktop UI
 
 Install the Python requirements, then launch the PySide6 app:
@@ -79,6 +93,8 @@ venv/bin/python ui_app.py
 ```
 
 The UI uses the same transcription engine as the CLI. It defaults to BlackHole 2ch when that input is visible, `base` model, German language, saved transcripts, and 2-second provisional partials.
+
+Speaker labels can be enabled from the UI. Use the reset button if the app learns poor speaker profiles during the current listening session.
 
 ## Capturing system audio with BlackHole 2ch
 

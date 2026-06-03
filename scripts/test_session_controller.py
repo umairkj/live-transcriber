@@ -13,6 +13,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from live_transcriber.audio import AudioFrame
 from live_transcriber.device_utils import DeviceInfo
 from live_transcriber.session import LiveTranscriberCallbacks, LiveTranscriberConfig, LiveTranscriberSession
+from live_transcriber.speakers import SpeakerInfo
 
 
 class FakeRecorder:
@@ -52,6 +53,27 @@ class FakeWriter:
 
     def write_record(self, record: dict[str, Any]) -> None:
         self.records.append(record)
+
+
+class FakeSpeakerLabeler:
+    def __init__(self) -> None:
+        self.reset_count = 0
+
+    def label(self, audio: np.ndarray, sample_rate: int, utterance_id: int) -> SpeakerInfo:
+        del audio, sample_rate, utterance_id
+        return SpeakerInfo(speaker_label="A", confidence=0.99, backend="fake")
+
+    def reset(self) -> None:
+        self.reset_count += 1
+
+
+class FailingSpeakerLabeler:
+    def label(self, audio: np.ndarray, sample_rate: int, utterance_id: int) -> SpeakerInfo:
+        del audio, sample_rate, utterance_id
+        raise RuntimeError("speaker model failed")
+
+    def reset(self) -> None:
+        return None
 
 
 def frame(value: float, samples: int = 100) -> np.ndarray:
@@ -144,6 +166,95 @@ def test_session_saves_final_records_when_enabled() -> None:
     assert writer.records[0]["text"] == "ich putze zaehne"
 
 
+def test_speaker_labeler_adds_display_prefix_and_record_metadata() -> None:
+    recorder = FakeRecorder([frame(0.1), frame(0.1), frame(0.1), frame(0.0), frame(0.0)])
+    writer = FakeWriter()
+    labeler = FakeSpeakerLabeler()
+    session = LiveTranscriberSession(
+        recorder_factory=lambda config: recorder,
+        transcriber_factory=lambda config: FakeTranscriber(),
+        writer_factory=lambda config: writer,
+        speaker_labeler_factory=lambda config: labeler,
+        device_provider=lambda: [DeviceInfo(0, "BlackHole 2ch", 2, 48000.0)],
+    )
+    partials: list[str] = []
+    finals: list[str] = []
+
+    config = LiveTranscriberConfig(
+        device=0,
+        save_transcript=True,
+        sample_rate=1000,
+        pause_seconds=0.2,
+        pre_roll_seconds=0.0,
+        min_speech_seconds=0.1,
+        min_segment_seconds=0.1,
+        partial_seconds=0.001,
+        speaker_labels=True,
+        speaker_backend="local",
+    )
+    callbacks = LiveTranscriberCallbacks(
+        on_partial_text=partials.append,
+        on_final_text=lambda text, record: finals.append(text),
+    )
+
+    session.start(config, callbacks)
+    deadline = time.time() + 2
+    while not finals and time.time() < deadline:
+        time.sleep(0.01)
+    session.reset_speakers()
+    session.stop()
+    session.join(2)
+
+    assert partials
+    assert all(not partial.startswith("A:") for partial in partials)
+    assert finals == ["A: ich putze zaehne"]
+    assert labeler.reset_count == 1
+    assert len(writer.records) == 1
+    assert writer.records[0]["text"] == "ich putze zaehne"
+    assert writer.records[0]["speaker_label"] == "A"
+    assert writer.records[0]["speaker_confidence"] == 0.99
+    assert writer.records[0]["speaker_backend"] == "fake"
+
+
+def test_speaker_backend_failure_does_not_stop_transcription() -> None:
+    recorder = FakeRecorder([frame(0.1), frame(0.1), frame(0.1), frame(0.0), frame(0.0)])
+    session = LiveTranscriberSession(
+        recorder_factory=lambda config: recorder,
+        transcriber_factory=lambda config: FakeTranscriber(),
+        speaker_labeler_factory=lambda config: FailingSpeakerLabeler(),
+        device_provider=lambda: [DeviceInfo(0, "BlackHole 2ch", 2, 48000.0)],
+    )
+    finals: list[str] = []
+    errors: list[str] = []
+
+    config = LiveTranscriberConfig(
+        device=0,
+        save_transcript=False,
+        sample_rate=1000,
+        pause_seconds=0.2,
+        pre_roll_seconds=0.0,
+        min_speech_seconds=0.1,
+        min_segment_seconds=0.1,
+        partial_seconds=0,
+        speaker_labels=True,
+        speaker_backend="local",
+    )
+    callbacks = LiveTranscriberCallbacks(
+        on_final_text=lambda text, record: finals.append(text),
+        on_error=errors.append,
+    )
+
+    session.start(config, callbacks)
+    deadline = time.time() + 2
+    while not finals and time.time() < deadline:
+        time.sleep(0.01)
+    session.stop()
+    session.join(2)
+
+    assert finals == ["ich putze zaehne"]
+    assert any("Speaker labels disabled" in error for error in errors)
+
+
 def test_device_list_adapter() -> None:
     session = LiveTranscriberSession(device_provider=lambda: [DeviceInfo(7, "Example Mic", 1, 44100.0)])
     devices = session.list_devices()
@@ -153,6 +264,8 @@ def test_device_list_adapter() -> None:
 def main() -> None:
     test_session_emits_events_and_does_not_save_when_disabled()
     test_session_saves_final_records_when_enabled()
+    test_speaker_labeler_adds_display_prefix_and_record_metadata()
+    test_speaker_backend_failure_does_not_stop_transcription()
     test_device_list_adapter()
     print("session controller tests passed")
 

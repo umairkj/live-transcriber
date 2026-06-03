@@ -13,7 +13,7 @@ logger = logging.getLogger(__name__)
 
 
 class FasterWhisperTranscriber:
-    """Small wrapper around faster-whisper for chunk transcription."""
+    """Small wrapper around faster-whisper for speech segment transcription."""
 
     def __init__(
         self,
@@ -21,11 +21,13 @@ class FasterWhisperTranscriber:
         device_type: str = "cpu",
         compute_type: str = "int8",
         language: str | None = None,
+        beam_size: int = 1,
     ) -> None:
         self.model_name = model_name
         self.device_type = device_type
         self.compute_type = compute_type
         self.language = language
+        self.beam_size = int(beam_size)
 
         try:
             from faster_whisper import WhisperModel
@@ -60,7 +62,7 @@ class FasterWhisperTranscriber:
         try:
             return self._transcribe_source(str(wav_path))
         except Exception as exc:
-            raise RuntimeError(f"Could not transcribe audio chunk: {exc}") from exc
+            raise RuntimeError(f"Could not transcribe speech segment: {exc}") from exc
         finally:
             wav_path.unlink(missing_ok=True)
 
@@ -68,7 +70,10 @@ class FasterWhisperTranscriber:
         segments_iter, info = self.model.transcribe(
             source,
             language=self.language,
-            beam_size=1,
+            beam_size=self.beam_size,
+            temperature=0.0,
+            condition_on_previous_text=False,
+            vad_filter=False,
         )
 
         segments: list[dict[str, float | str]] = []

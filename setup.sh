@@ -118,73 +118,12 @@ blackhole_installed() {
     [ -d "$HOME/Library/Audio/Plug-Ins/HAL/BlackHole2ch.driver" ]
 }
 
-print_blackhole_setup_help() {
-  cat <<'BLACKHOLE_HELP'
-
-System audio capture setup:
-1. In Audio MIDI Setup, click the + button in the lower-left corner.
-2. Choose Create Multi-Output Device.
-3. Check your speakers/headphones and BlackHole 2ch.
-4. Optional but recommended: enable Drift Correction for BlackHole 2ch.
-5. Control-click the Multi-Output Device and choose Use This Device For Sound Output.
-6. Do not set macOS Output directly to BlackHole 2ch, or your speakers will go silent.
-7. In this app, use BlackHole 2ch as the input device.
-
-macOS does not provide a reliable supported shell command for creating a
-Multi-Output Device, so setup opens the right app and guides that step.
-BLACKHOLE_HELP
-}
-
-open_audio_midi_setup() {
-  if [ "$(uname -s)" = "Darwin" ]; then
-    open -a "Audio MIDI Setup" >/dev/null 2>&1 || true
-  fi
-}
-
-open_sound_settings() {
-  if [ "$(uname -s)" = "Darwin" ]; then
-    open "x-apple.systempreferences:com.apple.Sound-Settings.extension" >/dev/null 2>&1 || \
-      open -a "System Settings" >/dev/null 2>&1 || true
-  fi
-}
-
-guide_blackhole_system_audio_setup() {
-  print_blackhole_setup_help
-
-  if confirm "Open Audio MIDI Setup now? [Y/n]" "Y"; then
-    open_audio_midi_setup
-  fi
-
-  printf '\nCreate the Multi-Output Device now, then come back here.\n'
-  read -r -p "Press Enter when the Multi-Output Device is ready..."
-
-  printf '\nIn Audio MIDI Setup, control-click the Multi-Output Device and choose "Use This Device For Sound Output".\n'
-  printf 'Do not choose BlackHole 2ch as macOS Output directly; it should only be checked inside the Multi-Output Device.\n'
-  read -r -p "Press Enter when the Multi-Output Device is set as sound output..."
-
-  if confirm "Open macOS Sound settings to double-check Output? [y/N]" "N"; then
-    open_sound_settings
-  fi
-}
-
-blackhole_visible_to_app() {
-  [ -x venv/bin/python ] && \
-    venv/bin/python app.py --list-devices 2>/dev/null | grep -qi 'blackhole'
-}
-
-restart_coreaudio() {
-  if [ "$(uname -s)" != "Darwin" ]; then
-    warn "CoreAudio restart is only available on macOS."
-    return 1
-  fi
-
-  printf '\nRestarting CoreAudio. macOS may ask for your password.\n'
-  sudo killall coreaudiod
-  sleep 3
-}
-
 recommended_model() {
-  printf 'small'
+  if [ "$(uname -s)" = "Darwin" ] && [ "$(uname -m)" = "arm64" ]; then
+    printf 'small'
+  else
+    printf 'base'
+  fi
 }
 
 choose_model() {
@@ -222,7 +161,6 @@ if [ "$(uname -s)" != "Darwin" ]; then
 fi
 
 mkdir -p transcripts
-LIST_DEVICES_AFTER_SETUP="N"
 
 if ! have_brew; then
   warn "Homebrew was not found."
@@ -259,7 +197,7 @@ else
   warn "Homebrew is unavailable. Skipping system dependency checks."
 fi
 
-if confirm "Do you want to set up BlackHole 2ch for capturing system audio from macOS apps? [y/N]" "N"; then
+if confirm "Do you want to install BlackHole 2ch for capturing system audio from macOS apps? [y/N]" "N"; then
   if blackhole_installed; then
     info "BlackHole 2ch already appears to be installed."
   elif have_brew; then
@@ -268,8 +206,16 @@ if confirm "Do you want to set up BlackHole 2ch for capturing system audio from 
     warn "Homebrew is required to install BlackHole 2ch automatically."
   fi
 
-  guide_blackhole_system_audio_setup
-  LIST_DEVICES_AFTER_SETUP="Y"
+  cat <<'BLACKHOLE_HELP'
+
+To capture system audio:
+1. Open Audio MIDI Setup.
+2. Create a Multi-Output Device.
+3. Add your speakers/headphones and BlackHole 2ch.
+4. Set macOS system output to that Multi-Output Device.
+5. Run: venv/bin/python app.py --list-devices
+6. Use the BlackHole input device ID with: venv/bin/python app.py --device <ID>
+BLACKHOLE_HELP
 fi
 
 if ! PYTHON_BIN="$(find_python_bin)"; then
@@ -336,29 +282,32 @@ PY
 fi
 
 if confirm "Do you want to list your audio input devices now? [Y/n]" "Y"; then
-  if [ "$LIST_DEVICES_AFTER_SETUP" = "Y" ]; then
-    info "Look for BlackHole 2ch in this device list."
-  fi
-
   if ! venv/bin/python app.py --list-devices; then
     warn "Could not list audio input devices."
-  fi
-
-  if [ "$LIST_DEVICES_AFTER_SETUP" = "Y" ] && ! blackhole_visible_to_app; then
-    warn "BlackHole 2ch is installed, but it is not visible to the app yet."
-    if confirm "Restart CoreAudio now? This usually makes BlackHole appear. [Y/n]" "Y"; then
-      restart_coreaudio || warn "Could not restart CoreAudio automatically."
-      printf '\nAudio input devices after CoreAudio restart:\n'
-      venv/bin/python app.py --list-devices || warn "Could not list audio input devices."
-    fi
-    if ! blackhole_visible_to_app; then
-      warn "BlackHole 2ch still is not visible. Restart your Mac, then run: venv/bin/python app.py --list-devices"
-    fi
   fi
 fi
 
 if confirm "Do you want to start live transcription now? [y/N]" "N"; then
-  ./t start
+  DEFAULT_RUN_MODEL="$(recommended_model)"
+  read -r -p "Model name [$DEFAULT_RUN_MODEL]: " RUN_MODEL
+  RUN_MODEL="${RUN_MODEL:-$DEFAULT_RUN_MODEL}"
+  read -r -p "Language code, empty for auto-detect []: " RUN_LANGUAGE
+  read -r -p "Chunk seconds [6]: " RUN_CHUNK_SECONDS
+  RUN_CHUNK_SECONDS="${RUN_CHUNK_SECONDS:-6}"
+  read -r -p "Device ID, empty for default input device []: " RUN_DEVICE
+
+  CMD=(venv/bin/python app.py --model "$RUN_MODEL" --chunk-seconds "$RUN_CHUNK_SECONDS")
+  if [ -n "$RUN_LANGUAGE" ]; then
+    CMD+=(--language "$RUN_LANGUAGE")
+  fi
+  if [ -n "$RUN_DEVICE" ]; then
+    CMD+=(--device "$RUN_DEVICE")
+  fi
+
+  printf '\nRunning:'
+  printf ' %q' "${CMD[@]}"
+  printf '\n\n'
+  "${CMD[@]}"
 fi
 
 cat <<'NEXT_STEPS'
@@ -369,5 +318,5 @@ Useful next commands:
 
 source venv/bin/activate
 venv/bin/python app.py --list-devices
-./t start
+venv/bin/python app.py --model small --language de --chunk-seconds 6
 NEXT_STEPS

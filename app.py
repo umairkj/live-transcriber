@@ -2,9 +2,6 @@ from __future__ import annotations
 
 import argparse
 import logging
-import time
-from threading import Thread
-from datetime import datetime
 from pathlib import Path
 
 from live_transcriber.config import (
@@ -25,6 +22,7 @@ from live_transcriber.config import (
     DEFAULT_SAMPLE_RATE,
     DEFAULT_SILENCE_THRESHOLD,
 )
+from live_transcriber.session import LiveTranscriberCallbacks, LiveTranscriberConfig, LiveTranscriberSession
 
 
 logger = logging.getLogger(__name__)
@@ -191,230 +189,61 @@ def run(args: argparse.Namespace) -> int:
             return 1
         return 0
 
-    from live_transcriber.device_utils import ensure_input_devices_available, validate_input_device
-
     try:
         validate_args(args)
-        ensure_input_devices_available()
-        validate_input_device(args.device)
-    except (RuntimeError, ValueError) as exc:
+    except ValueError as exc:
         logger.error("%s", exc)
         return 1
 
-    text_path = Path(args.output)
-    jsonl_path = None if args.no_jsonl else Path(args.jsonl_output)
-
-    from live_transcriber.writer import TranscriptWriter
-
-    try:
-        writer = TranscriptWriter(text_path=text_path, jsonl_path=jsonl_path, overwrite=args.overwrite)
-    except OSError as exc:
-        logger.error("Could not prepare transcript files: %s", exc)
-        return 1
-
-    print(f"Loading model: {args.model}", flush=True)
-    from live_transcriber.transcriber import FasterWhisperTranscriber
-
-    try:
-        transcriber = FasterWhisperTranscriber(
-            model_name=args.model,
-            device_type=args.device_type,
-            compute_type=args.compute_type,
-            language=args.language,
-            beam_size=args.beam_size,
-        )
-    except RuntimeError as exc:
-        logger.error("%s", exc)
-        return 1
-
-    from live_transcriber.audio import ContinuousAudioRecorder
-    from live_transcriber.deduper import RecentTextDeduper
-    from live_transcriber.jobs import TranscriptionJob, TranscriptionJobQueue
-    from live_transcriber.partials import PartialTextTracker
-    from live_transcriber.segmentation import SpeechSegmenter
-    from live_transcriber.text_cleanup import cleanup_transcript_text, is_garbage_fragment
-
-    recorder = ContinuousAudioRecorder(
-        sample_rate=args.sample_rate,
-        channels=1,
+    config = LiveTranscriberConfig(
+        model=args.model,
         device=args.device,
-        frame_duration_ms=args.frame_duration_ms,
-    )
-    segmenter = SpeechSegmenter(
+        language=args.language,
+        text_path=Path(args.output),
+        jsonl_path=None if args.no_jsonl else Path(args.jsonl_output),
+        save_transcript=True,
+        overwrite=args.overwrite,
         sample_rate=args.sample_rate,
-        speech_threshold=args.silence_threshold,
+        silence_threshold=args.silence_threshold,
         pause_seconds=args.pause_seconds,
         pre_roll_seconds=args.pre_roll_seconds,
         min_speech_seconds=args.min_speech_seconds,
         min_segment_seconds=args.min_segment_seconds,
         max_segment_seconds=args.max_segment_seconds,
+        frame_duration_ms=args.frame_duration_ms,
+        partial_seconds=args.partial_seconds,
+        min_text_length=args.min_text_length,
+        compute_type=args.compute_type,
+        device_type=args.device_type,
+        beam_size=args.beam_size,
     )
-    jobs = TranscriptionJobQueue()
 
-    print("Listening...", flush=True)
-    print(f"Transcript text file: {text_path}", flush=True)
-    if jsonl_path is not None:
-        print(f"JSONL file: {jsonl_path}", flush=True)
-    print("Press Ctrl+C to stop.", flush=True)
-    print("", flush=True)
+    def on_status(message: str) -> None:
+        if message == "Listening":
+            print("Listening...", flush=True)
+            print(f"Transcript text file: {config.text_path}", flush=True)
+            if config.jsonl_path is not None:
+                print(f"JSONL file: {config.jsonl_path}", flush=True)
+            print("Press Ctrl+C to stop.", flush=True)
+            print("", flush=True)
+        elif message == "Stopping":
+            print("\nStopping...", flush=True)
+        elif message != "Stopped":
+            print(message, flush=True)
 
-    deduper = RecentTextDeduper()
-    partial_tracker = PartialTextTracker()
+    callbacks = LiveTranscriberCallbacks(
+        on_status=on_status,
+        on_partial_text=lambda text: print(f"[partial] {text}", flush=True),
+        on_final_text=lambda text, record: print(text, flush=True),
+        on_error=lambda message: logger.error("%s", message),
+    )
 
-    def transcribe_jobs() -> None:
-        while True:
-            job = jobs.get()
-            try:
-                if job is None:
-                    return
+    session = LiveTranscriberSession()
+    exit_code = session.run_blocking(config, callbacks)
 
-                if job.kind == "partial":
-                    if jobs.is_completed(job.utterance_id):
-                        continue
-
-                    try:
-                        result = transcriber.transcribe(job.audio, sample_rate=args.sample_rate)
-                    except RuntimeError as exc:
-                        logger.error("Partial transcription failed: %s", exc)
-                        continue
-
-                    if jobs.is_completed(job.utterance_id):
-                        continue
-
-                    text = cleanup_transcript_text(str(result.get("text", "")))
-                    if is_garbage_fragment(text, args.min_text_length):
-                        logger.debug("Skipping empty, too-short, or garbage partial transcription: %r", text)
-                        continue
-
-                    new_text = partial_tracker.update(job.utterance_id, text)
-                    if new_text:
-                        print(f"[partial] {new_text}", flush=True)
-                    continue
-
-                partial_tracker.finish(job.utterance_id)
-                try:
-                    result = transcriber.transcribe(job.audio, sample_rate=args.sample_rate)
-                except RuntimeError as exc:
-                    logger.error("Transcription failed for this segment: %s", exc)
-                    continue
-
-                text = cleanup_transcript_text(str(result.get("text", "")))
-                if is_garbage_fragment(text, args.min_text_length):
-                    logger.debug("Skipping empty, too-short, or garbage transcription: %r", text)
-                    continue
-                if deduper.is_duplicate(text):
-                    logger.debug("Skipping duplicate transcription: %r", text)
-                    continue
-                deduper.remember(text)
-
-                timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                record = {
-                    "timestamp": timestamp,
-                    "text": text,
-                    "language": result.get("language"),
-                    "language_probability": result.get("language_probability"),
-                    "utterance_id": job.utterance_id,
-                    "duration_seconds": job.duration_seconds,
-                    "speech_seconds": job.speech_seconds,
-                    "closed_by": job.closed_by,
-                    "rms_peak": job.rms_peak,
-                    "model": args.model,
-                    "device_id": args.device,
-                    "sample_rate": args.sample_rate,
-                    "beam_size": args.beam_size,
-                    "segments": result.get("segments", []),
-                }
-
-                print(text, flush=True)
-                try:
-                    writer.write_record(record)
-                except OSError as exc:
-                    logger.error("Could not write transcript record: %s", exc)
-            finally:
-                jobs.task_done(job)
-
-    worker = Thread(target=transcribe_jobs, name="whisper-transcriber")
-    worker.start()
-
-    def enqueue_final(segment) -> None:  # noqa: ANN001
-        jobs.put_final(
-            TranscriptionJob(
-                kind="final",
-                utterance_id=segment.utterance_id,
-                audio=segment.audio,
-                duration_seconds=segment.duration_seconds,
-                speech_seconds=segment.speech_seconds,
-                rms_peak=segment.rms_peak,
-                closed_by=segment.closed_by,
-            )
-        )
-
-    def try_enqueue_partial() -> bool:
-        active_utterance_id = segmenter.current_utterance_id
-        if active_utterance_id is None or not jobs.can_accept_partial(active_utterance_id):
-            return False
-
-        snapshot = segmenter.active_snapshot()
-        if snapshot is None:
-            return False
-
-        return jobs.try_put_partial(
-            TranscriptionJob(
-                kind="partial",
-                utterance_id=snapshot.utterance_id,
-                audio=snapshot.audio,
-                duration_seconds=snapshot.duration_seconds,
-                speech_seconds=snapshot.speech_seconds,
-                rms_peak=snapshot.rms_peak,
-            )
-        )
-
-    exit_code = 0
-    last_partial_at = 0.0
-    last_partial_utterance_id: int | None = None
-    try:
-        with recorder:
-            while True:
-                frame = recorder.read(timeout=0.2)
-                if frame is None:
-                    continue
-                if frame.status:
-                    logger.debug("Audio callback status: %s", frame.status)
-
-                for segment in segmenter.process(frame.audio):
-                    enqueue_final(segment)
-
-                if args.partial_seconds <= 0:
-                    continue
-
-                active_utterance_id = segmenter.current_utterance_id
-                if active_utterance_id is None:
-                    last_partial_at = 0.0
-                    last_partial_utterance_id = None
-                    continue
-
-                now = time.monotonic()
-                if active_utterance_id != last_partial_utterance_id:
-                    last_partial_utterance_id = active_utterance_id
-                    last_partial_at = now
-                    continue
-
-                if now - last_partial_at >= args.partial_seconds and try_enqueue_partial():
-                    last_partial_at = now
-    except KeyboardInterrupt:
-        print("\nStopping...", flush=True)
-    except RuntimeError as exc:
-        logger.error("%s", exc)
-        exit_code = 1
-    finally:
-        final_segment = segmenter.flush()
-        if final_segment is not None:
-            enqueue_final(final_segment)
-        jobs.put_stop()
-        worker.join()
-        print(f"Transcript text file: {text_path}", flush=True)
-        if jsonl_path is not None:
-            print(f"JSONL file: {jsonl_path}", flush=True)
+    print(f"Transcript text file: {config.text_path}", flush=True)
+    if config.jsonl_path is not None:
+        print(f"JSONL file: {config.jsonl_path}", flush=True)
 
     return exit_code
 

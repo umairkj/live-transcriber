@@ -70,6 +70,16 @@ Disable provisional output with:
 venv/bin/python app.py --model base --language de --partial-seconds 0
 ```
 
+## Run the macOS desktop UI
+
+Install the Python requirements, then launch the PySide6 app:
+
+```bash
+venv/bin/python ui_app.py
+```
+
+The UI uses the same transcription engine as the CLI. It defaults to BlackHole 2ch when that input is visible, `base` model, German language, saved transcripts, and 2-second provisional partials.
+
 ## Capturing system audio with BlackHole 2ch
 
 BlackHole needs to be installed separately:

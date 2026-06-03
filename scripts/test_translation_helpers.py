@@ -25,6 +25,17 @@ def test_selective_translations_extract_useful_words() -> None:
     assert any(hint["source"] == "Wasser" and hint["article"] == "das" for hint in hints)
 
 
+def test_light_verbs_are_not_translated() -> None:
+    hints = build_selective_translations("Ich habe das gemacht und hat gefragt.")
+    sources = {hint["source"] for hint in hints}
+    translations = {hint["translation"] for hint in hints}
+    assert "habe" not in sources
+    assert "gemacht" not in sources
+    assert "hat" not in sources
+    assert "gefragt" in sources
+    assert not {"have", "has", "do", "make"}.intersection(translations)
+
+
 def test_selective_translations_are_english_only_for_now() -> None:
     assert build_selective_translations("Ich trinke Wasser.", target_language="fr") == []
 
@@ -37,8 +48,10 @@ def test_ollama_word_hints_extract_many_nouns_and_verbs() -> None:
                 "content": (
                     '{"items":['
                     '{"source":"sitzt","translation":"sits","kind":"verb"},'
+                    '{"source":"hab","translation":"have","kind":"verb"},'
                     '{"source":"Opfer","translation":"victim","kind":"noun","article":"das"},'
                     '{"source":"möchte","translation":"wants","kind":"verb"},'
+                    '{"source":"hat","translation":"has","kind":"verb"},'
                     '{"source":"gefragt","translation":"asked","kind":"verb"},'
                     '{"source":"Panzer","translation":"armor","kind":"noun","article":"der"}'
                     "]}"
@@ -59,6 +72,8 @@ def test_ollama_word_hints_extract_many_nouns_and_verbs() -> None:
     assert ("Opfer", "victim") in pairs
     assert ("möchte", "wants") in pairs
     assert ("Panzer", "armor") in pairs
+    assert ("hab", "have") not in pairs
+    assert ("hat", "has") not in pairs
     assert any(hint["source"] == "Panzer" and hint["article"] == "der" for hint in hints)
 
 
@@ -90,13 +105,14 @@ def test_dictionary_backend_uses_local_sqlite_lookup() -> None:
                 "INSERT INTO entries VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
                 [
                     ("gericht", "Gericht", "gericht", "Gericht", "court", "noun", "das", 0),
+                    ("hat", "hat", "haben", "haben", "has", "verb", "", 0),
                     ("lauft", "läuft", "laufen", "laufen", "runs", "verb", "", 0),
                 ],
             )
 
         client = DictionaryWordHintClient(db_path=db_path)
         hints, backend = build_selective_translation_result(
-            "Das Gericht läuft.",
+            "Das Gericht hat läuft.",
             backend="dictionary",
             client=client,
         )
@@ -104,11 +120,13 @@ def test_dictionary_backend_uses_local_sqlite_lookup() -> None:
         assert backend == "dictionary"
         assert ("Gericht", "court") in pairs
         assert ("läuft", "runs") in pairs
+        assert ("hat", "has") not in pairs
         assert any(hint["source"] == "Gericht" and hint["article"] == "das" for hint in hints)
 
 
 def main() -> None:
     test_selective_translations_extract_useful_words()
+    test_light_verbs_are_not_translated()
     test_selective_translations_are_english_only_for_now()
     test_ollama_word_hints_extract_many_nouns_and_verbs()
     test_ollama_word_hints_fall_back_to_builtin_glossary()

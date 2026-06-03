@@ -414,6 +414,8 @@ class DictionaryWordHintClient:
             translation = lookup.get("translation", "")
             if not translation:
                 continue
+            if kind == "verb" and _is_skipped_light_verb(key, translation):
+                continue
 
             article = candidate.get("article") or lookup.get("article", "")
             record = {
@@ -460,6 +462,8 @@ class DictionaryWordHintClient:
                 kind = "noun"
             elif not kind and _looks_like_german_verb(word):
                 kind = "verb"
+            if kind == "verb" and _is_skipped_light_verb(key, lookup.get("translation", "")):
+                continue
             if kind in {"noun", "verb"}:
                 candidates.append(
                     {
@@ -539,6 +543,7 @@ class OllamaWordHintClient:
             "For nouns, include the correct German article der, die, or das, using your best guess when needed. "
             "For verbs, omit article. "
             "Use short English translations like victim, ask, sit, run, wear. "
+            "Skip light or auxiliary verbs whose useful translation is only have, has, do, or make. "
             "Include finite verbs, infinitives, auxiliaries, and participles such as gefragt, angelegt, besetzt, getragen. "
             "Do not include adjectives, adverbs, pronouns, determiners, numbers, punctuation, or invented words."
         )
@@ -566,6 +571,7 @@ class OllamaWordHintClient:
                         "Use this shape: "
                         '{"items":[{"source":"word","translation":"English lemma","kind":"noun|verb|other","article":"der|die|das"}]}. '
                         "Classify every candidate as noun, verb, or other. Include translations only for nouns and verbs. "
+                        "Use kind other for light or auxiliary verbs whose useful translation is only have, has, do, or make. "
                         "For nouns, include der, die, or das. Include participles and auxiliary verbs as verbs."
                     ),
                 },
@@ -684,6 +690,8 @@ def _records_from_entries(items: list[object], text: str, max_items: int) -> lis
         source_key = _lookup_key(source)
         if source_key not in allowed_sources or source_key in seen:
             continue
+        if kind == "verb" and _is_skipped_light_verb(source_key, translation):
+            continue
         if kind == "noun" and article not in {"der", "die", "das"}:
             article = _NOUN_ARTICLES.get(source_key, "")
 
@@ -714,6 +722,11 @@ def _merge_hints(
         source = str(item.get("source") or "")
         key = _lookup_key(source)
         if not key or key in seen:
+            continue
+        if str(item.get("kind") or "") == "verb" and _is_skipped_light_verb(
+            key,
+            str(item.get("translation") or ""),
+        ):
             continue
         enriched = dict(item)
         fallback_item = fallback_by_key.get(key)
@@ -824,6 +837,8 @@ def _likely_missing_candidates(
         key = _lookup_key(word)
         if key in seen or key in existing:
             continue
+        if key in _SKIPPED_LIGHT_VERB_KEYS:
+            continue
         if key in _LEXICON:
             continue
         if key in _GERMAN_FUNCTION_WORDS and key not in _COMMON_GERMAN_VERBS:
@@ -857,6 +872,12 @@ def _looks_like_german_verb(word: str) -> bool:
         re.search(r"(en|ern|eln|est|st|te|ten|tet|t)$", key)
         or re.match(r"ge\w+(t|en)$", key)
     )
+
+
+def _is_skipped_light_verb(source_key: str, translation: str) -> bool:
+    if source_key in _SKIPPED_LIGHT_VERB_KEYS:
+        return True
+    return _lookup_key(translation) in _SKIPPED_LIGHT_VERB_TRANSLATIONS
 
 
 def _words(text: str) -> list[str]:

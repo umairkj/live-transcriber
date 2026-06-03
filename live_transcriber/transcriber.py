@@ -22,12 +22,14 @@ class FasterWhisperTranscriber:
         compute_type: str = "int8",
         language: str | None = None,
         beam_size: int = 1,
+        download_root: Path | str | None = None,
     ) -> None:
         self.model_name = model_name
         self.device_type = device_type
         self.compute_type = compute_type
         self.language = language
         self.beam_size = int(beam_size)
+        self.download_root = Path(download_root) if download_root is not None else None
 
         try:
             from faster_whisper import WhisperModel
@@ -35,7 +37,11 @@ class FasterWhisperTranscriber:
             raise RuntimeError("faster-whisper is not installed. Run ./setup.sh or pip install -r requirements.txt.") from exc
 
         try:
-            self.model = WhisperModel(model_name, device=device_type, compute_type=compute_type)
+            kwargs: dict[str, str] = {}
+            if self.download_root is not None:
+                self.download_root.mkdir(parents=True, exist_ok=True)
+                kwargs["download_root"] = str(self.download_root)
+            self.model = WhisperModel(model_name, device=device_type, compute_type=compute_type, **kwargs)
         except Exception as exc:
             raise RuntimeError(
                 f"Could not load faster-whisper model '{model_name}' "

@@ -1,27 +1,73 @@
-# live-transcriber
+# Live Transcriber
 
-A local macOS terminal prototype that continuously captures audio from an input device, detects speech segments, transcribes completed speech with `faster-whisper`, and saves the transcript to text and JSONL files.
+<p align="center">
+  <img src="assets/app_icon.png" alt="Live Transcriber app icon" width="128">
+</p>
 
-This is an early prototype for a future live translation and vocabulary-learning desktop app. It currently does live transcription, finalized-line translation, selective word hints, speaker labels, local LLM meeting minutes, and file saving.
+<p align="center">
+  Local live transcription for macOS, built for following real speech in another language.
+</p>
 
-## Why not Docker for macOS audio capture?
+Live Transcriber listens to a microphone or virtual audio device, turns speech into a running transcript, adds helpful English translations, and saves conversations you can come back to later. It is designed for local use on macOS, with special care for German learning, YouTube audio, meetings, and interviews.
 
-Docker is not recommended for the audio listener on macOS because containers do not get simple, reliable access to CoreAudio input devices. A normal Python virtual environment can talk directly to microphone input and virtual devices like BlackHole 2ch through `sounddevice`.
+## What It Does
 
-## Recommended installation
+- Captures audio continuously so Whisper can process speech without stopping the recorder.
+- Shows fast live partials while someone is still speaking.
+- Saves cleaner finalized transcript lines after pauses.
+- Adds full English translations for finalized lines.
+- Adds noun and verb word hints above German words.
+- Builds a vocabulary list as new words appear.
+- Optionally labels speakers as `A`, `B`, `C`.
+- Uses local Ollama models for meeting minutes.
+- Saves and loads tabbed `.trans` transcript files.
 
-Run the setup script:
+## Screenshots
+
+### Live Transcript Workspace
+
+![Live Transcriber workspace](assets/screenshots/live-workspace.png)
+
+### Settings And Model Setup
+
+![Live Transcriber settings](assets/screenshots/settings.png)
+
+## Quick Setup
+
+The easiest path is the setup script:
 
 ```bash
 chmod +x setup.sh
 ./setup.sh
 ```
 
-The script can install system dependencies, create a virtual environment, install Python packages, optionally install BlackHole 2ch, optionally install the German spaCy model, optionally build a local German-English dictionary, optionally pre-download a Whisper model, and help you list or test audio devices.
+The setup script can:
 
-## Manual installation
+- install Homebrew system dependencies
+- create the Python virtual environment
+- install Python requirements
+- optionally install BlackHole 2ch for Mac system audio
+- optionally install the German spaCy model
+- optionally build the German-English dictionary
+- optionally download a Whisper model
 
-Advanced users can install dependencies manually:
+Then launch the desktop app:
+
+```bash
+venv/bin/python ui_app.py
+```
+
+In the app:
+
+1. Open the `Settings` tab.
+2. Download or confirm a Whisper model, usually `base` first.
+3. Pull an Ollama model if you want meeting minutes or richer word hints.
+4. Install spaCy and build the dictionary for better live word hints.
+5. Return to `Live`, choose an input device, and press `Start`.
+
+## Manual Setup
+
+Use this if you prefer to install pieces yourself:
 
 ```bash
 brew install portaudio ffmpeg
@@ -32,215 +78,221 @@ source venv/bin/activate
 venv/bin/python -m pip install -r requirements.txt
 ```
 
-## List audio input devices
-
-```bash
-venv/bin/python app.py --list-devices
-```
-
-Each input device is printed with its numeric device ID, name, input channel count, and default sample rate.
-
-## Run with microphone input
-
-Use the default macOS input device:
-
-```bash
-venv/bin/python app.py --model base
-```
-
-With a German language hint:
-
-```bash
-venv/bin/python app.py --model base --language de --output transcripts/german.txt
-```
-
-The terminal prints fast provisional lines during active speech and clean final lines after pauses. Provisional lines start with `[partial]` and are not saved. Final lines are saved to the transcript files.
-
-Use a specific input device:
-
-```bash
-venv/bin/python app.py --device 3 --model base --language de
-```
-
-The recorder uses `sounddevice.InputStream`, so audio capture keeps running while Whisper transcribes previous speech. The app sends active speech snapshots to Whisper every 2 seconds for fast provisional output, then sends the completed speech segment after a short pause for the saved final transcript.
-
-Disable provisional output with:
-
-```bash
-venv/bin/python app.py --model base --language de --partial-seconds 0
-```
-
-Translate finalized lines to English with Whisper:
-
-```bash
-venv/bin/python app.py --model base --language de --full-translation
-```
-
-Add selective English word hints for German nouns and verbs:
-
-```bash
-venv/bin/python app.py --model base --language de --selective-translation
-```
-
-By default, finalized-line word hints use local Ollama with `llama3.1:latest` to identify and translate many more nouns and verbs. If Ollama is unavailable, the app falls back to the fast local dictionary backend. Use `--selective-translation-backend dictionary` for dictionary-only mode or `--selective-translation-backend built_in_glossary` for the smallest fallback mode.
-
-Full translation applies only to finalized transcript lines. Live partial lines use the fast dictionary backend so noun/verb hints can appear without waiting for Ollama.
-
-For the best live partial word hints, install the German spaCy model and build the optional local FreeDict SQLite dictionary:
-
-```bash
-venv/bin/python -m spacy download de_core_news_sm
-venv/bin/python scripts/build_dictionary.py
-```
-
-Enable anonymous speaker labels on finalized lines with:
-
-```bash
-venv/bin/python app.py --model base --language de --speaker-labels
-```
-
-Speaker labels are optional and best-effort. The local backend uses SpeechBrain ECAPA speaker embeddings if the optional speaker packages are installed:
-
-```bash
-venv/bin/python -m pip install speechbrain torch torchaudio
-```
-
-When enabled, final terminal and text transcript lines are prefixed with labels like `A:` or `B:`. Partial lines remain unlabeled, and JSONL records keep raw text plus `speaker_label`, `speaker_confidence`, and `speaker_backend` fields. The `pyannote` backend is reserved for a later advanced implementation.
-
-## Run the macOS desktop UI
-
-Install the Python requirements, then launch the PySide6 app:
+Launch the UI:
 
 ```bash
 venv/bin/python ui_app.py
 ```
 
-The UI uses the same transcription engine as the CLI. It defaults to BlackHole 2ch when that input is visible, `base` model, German language, saved transcripts, 2-second provisional partials, full English translation, dictionary-backed live partial word hints, and Ollama-backed selective word hints for finalized transcript lines.
-
-Selective word hints appear directly above the German nouns and verbs inside finalized and live partial transcript lines. The right-side vocabulary panel accumulates new words from finalized lines with English meanings, so provisional mis-hearings do not become study words.
-
-The middle Minutes panel uses local Ollama with `llama3.1:latest` to update English meeting minutes after every 3 finalized transcript lines. It does not summarize partial lines. Install the model with:
+List audio inputs:
 
 ```bash
-ollama pull llama3.1
+venv/bin/python app.py --list-devices
 ```
 
-If Ollama is not already running, start it with:
+## Capturing Mac System Audio
 
-```bash
-ollama serve
-```
+For YouTube, podcasts, meetings, or any audio playing on your Mac, use BlackHole 2ch.
 
-The UI is tab-based. Use `New` for a fresh transcript, `Open` to continue a saved one, `Save` or `Save As` to write a `.trans` file, `Rename` to rename the tab and saved file, and `Close Tab` to close the current transcript. A `.trans` file is JSON and stores the transcript events, minutes panel, vocabulary panel, tab title, splitter size, and scroll positions.
-
-Vocabulary nouns include their German article when known, for example `die Zaehne` or `das Wasser`.
-
-Speaker labels can be enabled from the UI. Use the reset button if the app learns poor speaker profiles during the current listening session.
-
-## Capturing system audio with BlackHole 2ch
-
-BlackHole needs to be installed separately:
+Install it:
 
 ```bash
 brew install --cask blackhole-2ch
 ```
 
-Basic macOS setup:
+Then:
 
-1. Open Audio MIDI Setup.
-2. Create a Multi-Output Device.
-3. Add your built-in output or headphones and BlackHole 2ch.
+1. Open `Audio MIDI Setup`.
+2. Create a `Multi-Output Device`.
+3. Add your speakers or headphones and `BlackHole 2ch`.
 4. Set macOS system output to the Multi-Output Device.
-5. Run `venv/bin/python app.py --list-devices`.
-6. Use the BlackHole input device ID with `venv/bin/python app.py --device <ID>`.
+5. In Live Transcriber, choose `BlackHole 2ch` as the input.
 
-Example:
+If BlackHole does not appear, restart the audio app or restart your Mac.
+
+## Recommended Models
+
+For live transcription:
+
+- `tiny`: fastest, lowest quality
+- `base`: best first choice for low latency
+- `small`: better German accuracy, more latency
+- `medium` and `large-v3`: higher quality, usually slower than you want for live use
+
+For local LLM features:
+
+- `llama3.1:latest`: default for meeting minutes and careful finalized word hints
+- `llama3.2:3b`: smaller and faster if available in your Ollama library
+- `mistral:7b`: useful alternative local model
+
+Settings shows Whisper as ready if a model is usable from either the app-managed cache or the normal Hugging Face cache. That means a model can work even if it was downloaded before this app had its own Settings tab.
+
+## Optional Local Helpers
+
+Better German word hints:
 
 ```bash
-venv/bin/python app.py --device 3 --model base --language de
+venv/bin/python -m pip install spacy
+venv/bin/python -m spacy download de_core_news_sm
+venv/bin/python scripts/build_dictionary.py
 ```
 
-For a good Apple Silicon MacBook Air balance, use:
+Ollama minutes:
 
 ```bash
-venv/bin/python app.py --device <BLACKHOLE_ID> --model small --language de --beam-size 1
+ollama pull llama3.1
+ollama serve
 ```
 
-For lower latency, use `base` and keep the default 2-second provisional output:
+Optional speaker labels:
+
+```bash
+venv/bin/python -m pip install speechbrain torch torchaudio
+```
+
+## CLI Usage
+
+The desktop UI is the friendliest way to use the app, but the CLI is still useful for testing.
+
+Default input:
+
+```bash
+venv/bin/python app.py --model base --language de
+```
+
+Specific device:
+
+```bash
+venv/bin/python app.py --device <DEVICE_ID> --model base --language de
+```
+
+Lower latency live partials:
 
 ```bash
 venv/bin/python app.py --device <BLACKHOLE_ID> --model base --language de --beam-size 1
 ```
 
-## Recommended models
+Disable partials:
 
-`faster-whisper` downloads the selected model on first use if needed.
+```bash
+venv/bin/python app.py --model base --language de --partial-seconds 0
+```
 
-- `tiny`: fastest, lower quality
-- `base`: good low-latency first choice
-- `small`: recommended balance for Apple Silicon MacBook Air
-- `medium` and `large-v3`: likely too slow on an old Intel MacBook
+Add translation and word hints:
 
-## Output files
+```bash
+venv/bin/python app.py --model base --language de --full-translation --selective-translation
+```
 
-By default, transcripts are appended to:
+Enable speaker labels:
+
+```bash
+venv/bin/python app.py --model base --language de --speaker-labels
+```
+
+## Saved Files
+
+The UI saves tabbed transcript sessions as `.trans` files. These files include:
+
+- transcript events
+- partial and final lines
+- translations
+- vocabulary
+- meeting minutes
+- tab title
+- splitter sizes and scroll positions
+
+The CLI appends text and JSONL output by default:
 
 ```text
 transcripts/transcript.txt
 transcripts/transcript.jsonl
 ```
 
-Clear output files at startup with:
+Clear output files at startup:
 
 ```bash
 venv/bin/python app.py --overwrite
 ```
 
-Disable JSONL output with:
+Disable JSONL:
 
 ```bash
 venv/bin/python app.py --no-jsonl
 ```
 
+## App Assets
+
+- App icon source: `assets/app_icon.png`
+- macOS app icon: `assets/app_icon.icns`
+- Transparent branding logo: `assets/branding/live_transcriber_logo_transparent.png`
+
+## Build A macOS App
+
+Build a local `.app` with PySide6 deployment:
+
+```bash
+./scripts/build_macos_app.sh
+```
+
+Create a simple DMG from the generated app:
+
+```bash
+APP_PATH="$(find . -name 'Live Transcriber.app' -type d -print -quit)"
+
+rm -rf dist/dmg-root
+mkdir -p dist/dmg-root
+cp -R "$APP_PATH" dist/dmg-root/
+ln -s /Applications dist/dmg-root/Applications
+
+hdiutil create \
+  -volname "Live Transcriber" \
+  -srcfolder dist/dmg-root \
+  -ov \
+  -format UDZO \
+  "dist/Live Transcriber.dmg"
+```
+
+For public distribution, you will eventually want Developer ID signing and notarization so macOS Gatekeeper does not warn users.
+
 ## Troubleshooting
 
-### No input devices found
+### No Input Devices Found
 
-Check macOS Sound settings and confirm that your microphone or virtual input device is visible. Then run:
-
-```bash
-venv/bin/python app.py --list-devices
-```
-
-### macOS microphone permission problem
-
-If recording fails, open System Settings, then Privacy & Security, then Microphone. Make sure your terminal app has microphone access.
-
-### BlackHole does not show up
-
-Restart the app you are using for audio, or restart your Mac after installing BlackHole. Then run:
+Open macOS Sound settings and confirm that your microphone or virtual device is visible. Then run:
 
 ```bash
 venv/bin/python app.py --list-devices
 ```
 
-### Model download takes time
+### Microphone Permission Problem
 
-The first run can take a while because `faster-whisper` downloads the selected model. Later runs reuse the cached model.
+Open `System Settings > Privacy & Security > Microphone` and make sure your terminal app has microphone access.
 
-### Old Intel MacBook is slow
+### BlackHole Is Installed But Missing
 
-Try the smallest model first:
+Restart the app playing audio, restart Live Transcriber, or restart your Mac. Then check devices again:
 
 ```bash
-venv/bin/python app.py --model tiny
+venv/bin/python app.py --list-devices
 ```
 
-Use `--model tiny` or `--model base` for lower latency.
+### Whisper Says Not Downloaded But Transcription Works
 
-### Homebrew Python 3.14 venv or ensurepip error
+Whisper may already be available in the Hugging Face system cache. The Settings tab now checks both the app cache and the system cache.
 
-If Homebrew's latest `python3` fails while creating `venv`, install Python 3.13 and recreate the virtual environment:
+### spaCy Install Fails
+
+Try the manual commands:
+
+```bash
+venv/bin/python -m pip install spacy
+venv/bin/python -m spacy download de_core_news_sm
+```
+
+### Homebrew Python 3.14 Venv Error
+
+If Homebrew's latest `python3` fails while creating `venv`, install Python 3.13 and recreate the environment:
 
 ```bash
 brew install python@3.13
@@ -249,3 +301,7 @@ rm -rf venv
 source venv/bin/activate
 venv/bin/python -m pip install -r requirements.txt
 ```
+
+## Why Not Docker?
+
+Docker is not a good fit for this app on macOS because containers do not get simple, reliable access to CoreAudio input devices. A normal Python virtual environment can talk directly to microphones and virtual devices like BlackHole 2ch through `sounddevice`.

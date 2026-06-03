@@ -24,13 +24,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Build the local German-English word-hint dictionary.")
     parser.add_argument("--source", default=DEFAULT_FREEDICT_URL, help="FreeDict TEI path or URL.")
     parser.add_argument("--db", default=str(DEFAULT_DICTIONARY_PATH), help="Output SQLite DB path.")
+    parser.add_argument("--cache-dir", default="data", help="Directory used for downloaded dictionary source files.")
     parser.add_argument("--limit", type=int, default=0, help="Optional entry limit for tests/debugging.")
     return parser
 
 
 def main() -> int:
     args = build_parser().parse_args()
-    source = _download_if_needed(args.source)
+    source = _download_if_needed(args.source, Path(args.cache_dir))
     db_path = Path(args.db)
     count = build_dictionary(source, db_path, limit=args.limit or None)
     print(f"Dictionary built: {db_path} ({count} rows)")
@@ -190,11 +191,11 @@ def _is_single_word(value: str) -> bool:
     return bool(re.fullmatch(r"[\wÄÖÜäöüß.-]+", value, flags=re.UNICODE))
 
 
-def _download_if_needed(source: str) -> Path:
+def _download_if_needed(source: str, cache_dir: Path = Path("data")) -> Path:
     if not source.startswith(("http://", "https://")):
         return Path(source)
 
-    target = Path("data") / Path(source).name
+    target = cache_dir / Path(source).name
     if target.exists() and target.stat().st_size > 0:
         return target
 

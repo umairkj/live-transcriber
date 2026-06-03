@@ -31,6 +31,7 @@ from live_transcriber.speakers import DEFAULT_SPEAKER_BACKEND, SPEAKER_BACKENDS,
 from live_transcriber.translations import (
     DEFAULT_SELECTIVE_TRANSLATION_BACKEND,
     DEFAULT_TRANSLATION_TARGET_LANGUAGE,
+    DEFAULT_WORD_HINT_MODEL,
     SELECTIVE_TRANSLATION_BACKENDS,
 )
 
@@ -76,7 +77,9 @@ class LiveTranscriberConfig:
     full_translation: bool = False
     selective_translation: bool = False
     selective_translation_backend: str = DEFAULT_SELECTIVE_TRANSLATION_BACKEND
+    word_hint_model: str = DEFAULT_WORD_HINT_MODEL
     translation_target_language: str = DEFAULT_TRANSLATION_TARGET_LANGUAGE
+    whisper_download_root: Path | None = None
 
 
 @dataclass(frozen=True)
@@ -297,12 +300,19 @@ class LiveTranscriberSession:
                             record["translation_backend"] = "whisper"
 
                     if config.selective_translation:
-                        from live_transcriber.translations import build_selective_translation_result
+                        from live_transcriber.translations import (
+                            OllamaWordHintClient,
+                            build_selective_translation_result,
+                        )
 
+                        selective_client = None
+                        if config.selective_translation_backend == "ollama":
+                            selective_client = OllamaWordHintClient(model=config.word_hint_model)
                         selective_translations, selective_translation_backend = build_selective_translation_result(
                             text,
                             target_language=config.translation_target_language,
                             backend=config.selective_translation_backend,
+                            client=selective_client,
                         )
                         if selective_translations:
                             record["selective_translations"] = selective_translations
@@ -466,6 +476,7 @@ class LiveTranscriberSession:
             compute_type=config.compute_type,
             language=config.language,
             beam_size=config.beam_size,
+            download_root=config.whisper_download_root,
         )
 
     def _default_writer(self, config: LiveTranscriberConfig):

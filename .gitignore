@@ -22,6 +22,15 @@ data/*
 models/
 pretrained_models/
 
+# Packaging outputs
+build/
+dist/
+*.app/
+*.dmg
+*.build/
+*.dist/
+*.onefile-build/
+
 # macOS and editor files
 .DS_Store
 .idea/

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import sqlite3
 import unicodedata
@@ -390,7 +391,11 @@ class DictionaryWordHintClient:
     """Fast German noun/verb hints from spaCy POS tags plus local dictionary lookup."""
 
     def __init__(self, db_path: Path | str = DEFAULT_DICTIONARY_PATH) -> None:
-        self.db_path = Path(db_path)
+        env_path = os.environ.get("LIVE_TRANSCRIBER_DICTIONARY_PATH")
+        if env_path and Path(db_path) == DEFAULT_DICTIONARY_PATH:
+            self.db_path = Path(env_path)
+        else:
+            self.db_path = Path(db_path)
         self._nlp = _load_german_spacy_model()
 
     def build_hints(self, text: str, max_items: int = 80) -> list[dict[str, str]]:
@@ -894,6 +899,6 @@ def _lookup_key(word: str) -> str:
 def _ollama_error_message(message: str, model: str) -> str:
     normalized = message.casefold()
     if "not found" in normalized or "pull" in normalized or ("model" in normalized and "missing" in normalized):
-        model_name = model.split(":", 1)[0]
+        model_name = model.removesuffix(":latest")
         return f"Model {model} is missing. Install it with: ollama pull {model_name}"
     return message.strip() or "Ollama word-hint update failed."

@@ -2,12 +2,15 @@ from __future__ import annotations
 
 import html
 import json
+import os
 import re
+import subprocess
 import sys
 import unicodedata
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
+from urllib import error, request
 
 from live_transcriber.config import (
     DEFAULT_BEAM_SIZE,
@@ -18,17 +21,34 @@ from live_transcriber.config import (
     DEFAULT_PAUSE_SECONDS,
 )
 from live_transcriber.device_utils import DeviceInfo, get_input_devices
-from live_transcriber.minutes import MINUTES_UPDATE_FINAL_COUNT, MinutesError, OllamaMinutesClient
+from live_transcriber.minutes import DEFAULT_MINUTES_MODEL, MINUTES_UPDATE_FINAL_COUNT, MinutesError, OllamaMinutesClient
+from live_transcriber.model_assets import (
+    OLLAMA_MODELS,
+    WHISPER_MODELS,
+    AssetStatus,
+    blackhole_status,
+    default_app_data_dir,
+    dictionary_path,
+    dictionary_status,
+    ensure_app_dirs,
+    homebrew_path,
+    ollama_model_names,
+    ollama_status,
+    spacy_model_status,
+    whisper_download_root,
+    whisper_model_status,
+)
 from live_transcriber.session import LiveTranscriberCallbacks, LiveTranscriberConfig, LiveTranscriberSession
 from live_transcriber.speakers import DEFAULT_SPEAKER_BACKEND, SPEAKER_BACKENDS
 from live_transcriber.translations import (
+    DEFAULT_WORD_HINT_MODEL,
     DEFAULT_TRANSLATION_TARGET_LANGUAGE,
     build_selective_translations,
 )
 
 try:
-    from PySide6.QtCore import QObject, QThread, Qt, Signal, Slot
-    from PySide6.QtGui import QTextCursor
+    from PySide6.QtCore import QObject, QSettings, QSize, QStandardPaths, QThread, QTimer, Qt, Signal, Slot
+    from PySide6.QtGui import QColor, QIcon, QPainter, QPen, QPixmap, QTextCursor
     from PySide6.QtWidgets import (
         QApplication,
         QCheckBox,
@@ -37,12 +57,15 @@ try:
         QFileDialog,
         QFormLayout,
         QGridLayout,
+        QGroupBox,
         QHBoxLayout,
         QInputDialog,
         QLabel,
         QMainWindow,
         QMessageBox,
+        QProgressBar,
         QPushButton,
+        QScrollArea,
         QSplitter,
         QStyle,
         QTabWidget,
@@ -57,6 +80,7 @@ except ModuleNotFoundError as exc:
 TRANSCRIPT_SCHEMA_VERSION = 2
 TRANSCRIPT_FILE_SUFFIX = ".trans"
 SUPPORTED_TRANSCRIPT_SCHEMA_VERSIONS = {1, 2}
+APP_ICON_PATH = Path(__file__).resolve().parent / "assets" / "app_icon.png"
 
 
 @dataclass
@@ -151,33 +175,216 @@ class MinutesWorker(QObject):
             self.finished.emit(minutes, self._target_event_index)
 
 
+class AssetInstallWorker(QObject):
+    status = Signal(str)
+    progress = Signal(int)
+    finished = Signal(str)
+    error = Signal(str)
+
+    def __init__(self, task: str, asset_id: str, app_data_dir: Path) -> None:
+        super().__init__()
+        self._task = task
+        self._asset_id = asset_id
+        self._app_data_dir = app_data_dir
+        self._last_command: list[str] | None = None
+        self._last_output: list[str] = []
+
+    @Slot()
+    def run(self) -> None:
+        try:
+            if self._task == "whisper":
+                self._download_whisper()
+            elif self._task == "ollama":
+                self._pull_ollama()
+            elif self._task == "spacy":
+                self._install_spacy()
+            elif self._task == "dictionary":
+                self._build_dictionary()
+            elif self._task == "blackhole":
+                self._install_blackhole()
+            else:
+                raise RuntimeError(f"Unknown setup task: {self._task}")
+        except Exception as exc:  # noqa: BLE001
+            self.error.emit(self._format_failure(str(exc)))
+        else:
+            self.finished.emit(self._asset_id)
+
+    def _download_whisper(self) -> None:
+        self.status.emit(f"Downloading Whisper model: {self._asset_id}")
+        self.progress.emit(0)
+        root = whisper_download_root(self._app_data_dir)
+        root.mkdir(parents=True, exist_ok=True)
+        try:
+            from faster_whisper import WhisperModel
+        except ModuleNotFoundError as exc:
+            raise RuntimeError("faster-whisper is not installed. Run ./setup.sh or install requirements.") from exc
+
+        WhisperModel(self._asset_id, device="cpu", compute_type="int8", download_root=str(root))
+        self.progress.emit(100)
+        self.status.emit(f"Whisper model ready: {self._asset_id}")
+
+    def _pull_ollama(self) -> None:
+        self.status.emit(f"Pulling Ollama model: {self._asset_id}")
+        self.progress.emit(0)
+        payload = json.dumps({"name": self._asset_id, "stream": True}).encode("utf-8")
+        req = request.Request(
+            "http://localhost:11434/api/pull",
+            data=payload,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        try:
+            with request.urlopen(req, timeout=120) as response:
+                for raw_line in response:
+                    if not raw_line.strip():
+                        continue
+                    update = json.loads(raw_line.decode("utf-8"))
+                    status = str(update.get("status") or "").strip()
+                    if status:
+                        self.status.emit(status)
+                    completed = update.get("completed")
+                    total = update.get("total")
+                    if isinstance(completed, int) and isinstance(total, int) and total > 0:
+                        self.progress.emit(max(0, min(100, int(completed * 100 / total))))
+        except error.URLError as exc:
+            raise RuntimeError("Ollama is not running. Start it with: ollama serve") from exc
+        except TimeoutError as exc:
+            raise RuntimeError("Timed out connecting to Ollama. Start it with: ollama serve") from exc
+        self.progress.emit(100)
+        self.status.emit(f"Ollama model ready: {self._asset_id}")
+
+    def _install_spacy(self) -> None:
+        self.status.emit("Installing spaCy")
+        self.progress.emit(0)
+        self._run_subprocess([sys.executable, "-m", "pip", "install", "spacy"])
+        self.progress.emit(50)
+        self.status.emit("Installing German spaCy model")
+        self._run_subprocess([sys.executable, "-m", "spacy", "download", "de_core_news_sm"])
+        self.progress.emit(100)
+        self.status.emit("spaCy and German model ready")
+
+    def _build_dictionary(self) -> None:
+        self.status.emit("Building German-English dictionary")
+        self.progress.emit(0)
+        db_path = dictionary_path(self._app_data_dir)
+        from scripts import build_dictionary as dictionary_builder
+
+        source = dictionary_builder._download_if_needed(dictionary_builder.DEFAULT_FREEDICT_URL, db_path.parent)
+        self.status.emit("Indexing dictionary entries")
+        count = dictionary_builder.build_dictionary(source, db_path)
+        self.progress.emit(100)
+        self.status.emit(f"Dictionary ready: {db_path} ({count} rows)")
+
+    def _install_blackhole(self) -> None:
+        brew = homebrew_path()
+        if brew is None:
+            raise RuntimeError("Homebrew was not found. Install BlackHole manually with: brew install --cask blackhole-2ch")
+        self.status.emit("Installing BlackHole 2ch")
+        self.progress.emit(0)
+        self._run_subprocess([brew, "install", "--cask", "blackhole-2ch"])
+        self.progress.emit(100)
+        self.status.emit("BlackHole 2ch installed")
+
+    def _run_subprocess(self, command: list[str]) -> None:
+        self._last_command = command
+        self._last_output = []
+        process = subprocess.Popen(
+            command,
+            cwd=str(Path(__file__).resolve().parent),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+        )
+        assert process.stdout is not None
+        for line in process.stdout:
+            message = line.strip()
+            if message:
+                self._last_output.append(message)
+                self._last_output = self._last_output[-12:]
+                self.status.emit(message)
+        return_code = process.wait()
+        if return_code != 0:
+            raise RuntimeError(f"Command failed ({return_code}): {' '.join(command)}")
+
+    def _format_failure(self, message: str) -> str:
+        parts = [message]
+        if self._last_command is not None:
+            command = " ".join(self._last_command)
+            parts.append(f"Command: {command}")
+            parts.append(f"Manual command: {command}")
+        if self._last_output:
+            parts.append("Last output:")
+            parts.extend(self._last_output)
+        return "\n".join(parts)
+
+
 class MainWindow(QMainWindow):
     def __init__(self, minutes_client_factory: Callable[[], OllamaMinutesClient] | None = None) -> None:
         super().__init__()
         self.setWindowTitle("Live Transcriber")
+        if APP_ICON_PATH.exists():
+            self.setWindowIcon(QIcon(str(APP_ICON_PATH)))
         self.resize(980, 680)
+
+        app = QApplication.instance()
+        if app is not None:
+            app.setOrganizationName("LiveTranscriber")
+            app.setApplicationName("Live Transcriber")
+            if APP_ICON_PATH.exists():
+                app.setWindowIcon(QIcon(str(APP_ICON_PATH)))
+        QSettings.setDefaultFormat(QSettings.Format.IniFormat)
+        settings_file = os.environ.get("LIVE_TRANSCRIBER_SETTINGS_FILE")
+        if settings_file:
+            self.settings = QSettings(settings_file, QSettings.Format.IniFormat)
+        else:
+            self.settings = QSettings("LiveTranscriber", "LiveTranscriber")
+        qt_app_data = QStandardPaths.writableLocation(QStandardPaths.StandardLocation.AppDataLocation)
+        self._app_data_dir = Path(qt_app_data) if qt_app_data else default_app_data_dir()
+        ensure_app_dirs(self._app_data_dir)
+        os.environ.setdefault("LIVE_TRANSCRIBER_DICTIONARY_PATH", str(dictionary_path(self._app_data_dir)))
 
         self._thread: QThread | None = None
         self._worker: TranscriptionWorker | None = None
         self._minutes_thread: QThread | None = None
         self._minutes_worker: MinutesWorker | None = None
         self._minutes_document: TranscriptDocument | None = None
-        self._minutes_client_factory = minutes_client_factory or OllamaMinutesClient
+        self._minutes_client_factory = minutes_client_factory or self._create_minutes_client
         self._is_running = False
         self._documents: dict[QWidget, TranscriptDocument] = {}
         self._recording_document: TranscriptDocument | None = None
         self._untitled_count = 0
+        self._asset_threads: list[tuple[QThread, AssetInstallWorker]] = []
+        self._asset_buttons: dict[tuple[str, str], QPushButton] = {}
+        self._asset_button_defaults: dict[tuple[str, str], tuple[str, QIcon]] = {}
+        self._model_use_buttons: dict[tuple[str, str], QPushButton] = {}
+        self._active_asset_tasks: set[tuple[str, str]] = set()
+        self._spinner_frame = 0
+        self._spinner_icons = self._create_spinner_icons()
+        self._spinner_timer = QTimer(self)
+        self._spinner_timer.setInterval(90)
+        self._spinner_timer.timeout.connect(self._advance_spinner_icons)
+        self._asset_status_label: QLabel | None = None
+        self._asset_progress: QProgressBar | None = None
+        self._whisper_status_labels: dict[str, QLabel] = {}
+        self._ollama_status_labels: dict[str, QLabel] = {}
+        self._spacy_status_label: QLabel | None = None
+        self._dictionary_status_label: QLabel | None = None
+        self._blackhole_status_label: QLabel | None = None
+        self._selected_transcription_model_label: QLabel | None = None
+        self._selected_minutes_model_label: QLabel | None = None
+        self._selected_word_hints_model_label: QLabel | None = None
 
         self._build_ui()
         self.new_transcript()
         self.refresh_devices()
+        self._refresh_asset_statuses()
         self._set_running(False)
         self._update_speaker_controls()
         self._update_translation_controls()
 
     def _build_ui(self) -> None:
-        root = QWidget()
-        layout = QVBoxLayout(root)
+        live_page = QWidget()
+        layout = QVBoxLayout(live_page)
         layout.setContentsMargins(18, 18, 18, 14)
         layout.setSpacing(12)
 
@@ -202,8 +409,9 @@ class MainWindow(QMainWindow):
         options_grid.setVerticalSpacing(8)
 
         self.model_combo = QComboBox()
-        self.model_combo.addItems(["tiny", "base", "small", "medium"])
-        self.model_combo.setCurrentText(DEFAULT_MODEL)
+        self.model_combo.addItems([asset.asset_id for asset in WHISPER_MODELS])
+        self.model_combo.setCurrentText(str(self.settings.value("models/transcription", DEFAULT_MODEL)))
+        self.model_combo.currentTextChanged.connect(self._on_transcription_model_changed)
         options_grid.addWidget(QLabel("Model"), 0, 0)
         options_grid.addWidget(self.model_combo, 0, 1)
 
@@ -323,7 +531,512 @@ class MainWindow(QMainWindow):
         footer.addWidget(self.output_label)
         layout.addLayout(footer)
 
+        self.app_tabs = QTabWidget()
+        self.app_tabs.addTab(live_page, "Live")
+        self.app_tabs.addTab(self._build_settings_page(), "Settings")
+
+        root = QWidget()
+        root_layout = QVBoxLayout(root)
+        root_layout.setContentsMargins(0, 0, 0, 0)
+        root_layout.addWidget(self.app_tabs)
         self.setCentralWidget(root)
+
+    def _build_settings_page(self) -> QWidget:
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(18, 18, 18, 18)
+        layout.setSpacing(14)
+
+        heading = QLabel("Settings")
+        heading.setStyleSheet("font-size: 22px; font-weight: 800; color: #14222c;")
+        layout.addWidget(heading)
+
+        intro = QLabel(
+            "Choose local models, pre-download assets, and check whether audio capture support is ready."
+        )
+        intro.setWordWrap(True)
+        intro.setStyleSheet("color: #52616d;")
+        layout.addWidget(intro)
+
+        selection_group = QGroupBox("Selected Defaults")
+        selection_grid = QGridLayout(selection_group)
+        selection_grid.setHorizontalSpacing(14)
+        selection_grid.setVerticalSpacing(8)
+        self._selected_minutes_model_label = QLabel()
+        self._selected_word_hints_model_label = QLabel()
+        self._selected_transcription_model_label = QLabel(self.model_combo.currentText())
+        selection_grid.addWidget(QLabel("Transcription"), 0, 0)
+        selection_grid.addWidget(self._selected_transcription_model_label, 0, 1)
+        selection_grid.addWidget(QLabel("Meeting minutes"), 1, 0)
+        selection_grid.addWidget(self._selected_minutes_model_label, 1, 1)
+        selection_grid.addWidget(QLabel("Final word hints"), 2, 0)
+        selection_grid.addWidget(self._selected_word_hints_model_label, 2, 1)
+        layout.addWidget(selection_group)
+
+        whisper_group = QGroupBox("Whisper Transcription Models")
+        whisper_grid = QGridLayout(whisper_group)
+        whisper_grid.setHorizontalSpacing(10)
+        whisper_grid.setVerticalSpacing(8)
+        whisper_grid.addWidget(QLabel("Model"), 0, 0)
+        whisper_grid.addWidget(QLabel("Use"), 0, 1)
+        whisper_grid.addWidget(QLabel("Download"), 0, 2)
+        whisper_grid.addWidget(QLabel("Status"), 0, 3)
+        for row, asset in enumerate(WHISPER_MODELS, start=1):
+            label = QLabel(
+                f"<b>{html.escape(asset.label)}</b> "
+                f"<span style='color:#6b7882'>{html.escape(asset.size_hint)}</span><br>"
+                f"<span style='color:#53616b'>{html.escape(asset.description)}</span>"
+            )
+            label.setWordWrap(True)
+            whisper_grid.addWidget(label, row, 0)
+
+            use_button = QPushButton("Use")
+            use_button.clicked.connect(lambda _checked=False, model=asset.asset_id: self._set_transcription_model(model))
+            self._register_model_use_button("transcription", asset.asset_id, use_button)
+            whisper_grid.addWidget(use_button, row, 1)
+
+            download_button = QPushButton("Download")
+            download_button.clicked.connect(
+                lambda _checked=False, model=asset.asset_id: self._start_asset_task("whisper", model)
+            )
+            self._register_asset_button("whisper", asset.asset_id, download_button)
+            whisper_grid.addWidget(download_button, row, 2)
+
+            status_label = self._new_status_label()
+            self._whisper_status_labels[asset.asset_id] = status_label
+            whisper_grid.addWidget(status_label, row, 3)
+        whisper_grid.setColumnStretch(0, 1)
+        layout.addWidget(whisper_group)
+
+        ollama_group = QGroupBox("Local LLMs for Minutes and Word Hints")
+        ollama_grid = QGridLayout(ollama_group)
+        ollama_grid.setHorizontalSpacing(10)
+        ollama_grid.setVerticalSpacing(8)
+        ollama_grid.addWidget(QLabel("Model"), 0, 0)
+        ollama_grid.addWidget(QLabel("Use"), 0, 1)
+        ollama_grid.addWidget(QLabel("Pull"), 0, 2)
+        ollama_grid.addWidget(QLabel("Status"), 0, 3)
+        for row, asset in enumerate(OLLAMA_MODELS, start=1):
+            label = QLabel(
+                f"<b>{html.escape(asset.label)}</b> "
+                f"<span style='color:#6b7882'>{html.escape(asset.size_hint)}</span><br>"
+                f"<span style='color:#53616b'>{html.escape(asset.description)}</span>"
+            )
+            label.setWordWrap(True)
+            ollama_grid.addWidget(label, row, 0)
+
+            use_buttons = QVBoxLayout()
+            minutes_button = QPushButton("Minutes")
+            minutes_button.clicked.connect(
+                lambda _checked=False, model=asset.asset_id: self._set_minutes_model(model)
+            )
+            self._register_model_use_button("minutes", asset.asset_id, minutes_button)
+            word_hints_button = QPushButton("Word Hints")
+            word_hints_button.clicked.connect(
+                lambda _checked=False, model=asset.asset_id: self._set_word_hints_model(model)
+            )
+            self._register_model_use_button("word_hints", asset.asset_id, word_hints_button)
+            use_buttons.addWidget(minutes_button)
+            use_buttons.addWidget(word_hints_button)
+            ollama_grid.addLayout(use_buttons, row, 1)
+
+            pull_button = QPushButton("Pull")
+            pull_button.clicked.connect(
+                lambda _checked=False, model=asset.asset_id: self._start_asset_task("ollama", model)
+            )
+            self._register_asset_button("ollama", asset.asset_id, pull_button)
+            ollama_grid.addWidget(pull_button, row, 2)
+
+            status_label = self._new_status_label()
+            self._ollama_status_labels[asset.asset_id] = status_label
+            ollama_grid.addWidget(status_label, row, 3)
+        ollama_grid.setColumnStretch(0, 1)
+        layout.addWidget(ollama_group)
+
+        hints_group = QGroupBox("Live Word Hints")
+        hints_grid = QGridLayout(hints_group)
+        hints_grid.setHorizontalSpacing(10)
+        hints_grid.setVerticalSpacing(8)
+        self._spacy_status_label = self._new_status_label()
+        self._dictionary_status_label = self._new_status_label()
+        hints_grid.addWidget(QLabel("<b>spaCy + German model</b><br><span style='color:#53616b'>Better noun and verb detection.</span>"), 0, 0)
+        install_spacy = QPushButton("Install spaCy")
+        install_spacy.clicked.connect(lambda: self._start_asset_task("spacy", "de_core_news_sm"))
+        self._register_asset_button("spacy", "de_core_news_sm", install_spacy)
+        hints_grid.addWidget(install_spacy, 0, 1)
+        hints_grid.addWidget(self._spacy_status_label, 0, 2)
+        hints_grid.addWidget(QLabel("<b>German-English dictionary</b><br><span style='color:#53616b'>Fast offline translations for live partials.</span>"), 1, 0)
+        build_dictionary = QPushButton("Build")
+        build_dictionary.clicked.connect(lambda: self._start_asset_task("dictionary", "de_en.sqlite"))
+        self._register_asset_button("dictionary", "de_en.sqlite", build_dictionary)
+        hints_grid.addWidget(build_dictionary, 1, 1)
+        hints_grid.addWidget(self._dictionary_status_label, 1, 2)
+        hints_grid.setColumnStretch(0, 1)
+        layout.addWidget(hints_group)
+
+        audio_group = QGroupBox("Audio Capture")
+        audio_grid = QGridLayout(audio_group)
+        audio_grid.setHorizontalSpacing(10)
+        audio_grid.setVerticalSpacing(8)
+        self._blackhole_status_label = self._new_status_label()
+        audio_grid.addWidget(
+            QLabel(
+                "<b>BlackHole 2ch</b><br>"
+                "<span style='color:#53616b'>Virtual input for YouTube, meetings, and other Mac system audio.</span>"
+            ),
+            0,
+            0,
+        )
+        install_blackhole = QPushButton("Install")
+        install_blackhole.clicked.connect(self._confirm_blackhole_install)
+        self._register_asset_button("blackhole", "blackhole-2ch", install_blackhole)
+        audio_grid.addWidget(install_blackhole, 0, 1)
+        refresh_audio = QPushButton("Refresh")
+        refresh_audio.clicked.connect(self._refresh_asset_statuses)
+        audio_grid.addWidget(refresh_audio, 0, 2)
+        audio_grid.addWidget(self._blackhole_status_label, 0, 3)
+        audio_grid.setColumnStretch(0, 1)
+        layout.addWidget(audio_group)
+
+        storage_group = QGroupBox("Storage")
+        storage_grid = QGridLayout(storage_group)
+        storage_grid.setHorizontalSpacing(10)
+        storage_grid.setVerticalSpacing(8)
+        storage_path = QLabel(str(self._app_data_dir))
+        storage_path.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        storage_grid.addWidget(QLabel("Application data"), 0, 0)
+        storage_grid.addWidget(storage_path, 0, 1)
+        open_storage = QPushButton("Open")
+        open_storage.clicked.connect(self._open_app_data_dir)
+        storage_grid.addWidget(open_storage, 0, 2)
+        storage_grid.setColumnStretch(1, 1)
+        layout.addWidget(storage_group)
+
+        setup_group = QGroupBox("Setup Activity")
+        setup_layout = QVBoxLayout(setup_group)
+        self._asset_status_label = QLabel("Ready")
+        self._asset_status_label.setWordWrap(True)
+        self._asset_progress = QProgressBar()
+        self._asset_progress.setRange(0, 100)
+        self._asset_progress.setValue(0)
+        setup_layout.addWidget(self._asset_status_label)
+        setup_layout.addWidget(self._asset_progress)
+        layout.addWidget(setup_group)
+
+        refresh_all = QPushButton("Refresh Status")
+        refresh_all.clicked.connect(self._refresh_asset_statuses)
+        layout.addWidget(refresh_all)
+        layout.addStretch(1)
+
+        scroll.setWidget(page)
+        return scroll
+
+    def _new_status_label(self) -> QLabel:
+        label = QLabel("Checking...")
+        label.setWordWrap(True)
+        label.setStyleSheet("color: #4f5d67;")
+        label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        return label
+
+    def _register_asset_button(self, task: str, asset_id: str, button: QPushButton) -> None:
+        key = (task, asset_id)
+        self._asset_buttons[key] = button
+        self._asset_button_defaults[key] = (button.text(), button.icon())
+
+    def _register_model_use_button(self, role: str, model_id: str, button: QPushButton) -> None:
+        self._model_use_buttons[(role, model_id)] = button
+
+    def _create_spinner_icons(self) -> list[QIcon]:
+        icons: list[QIcon] = []
+        size = 18
+        center = size / 2
+        for frame in range(12):
+            pixmap = QPixmap(size, size)
+            pixmap.fill(Qt.GlobalColor.transparent)
+            painter = QPainter(pixmap)
+            painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+            for index in range(12):
+                alpha = int(40 + 215 * ((index + frame) % 12) / 11)
+                pen = QPen(QColor(35, 83, 91, alpha), 2.2)
+                pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+                painter.setPen(pen)
+                painter.save()
+                painter.translate(center, center)
+                painter.rotate(index * 30)
+                painter.drawLine(0, -6.5, 0, -8.0)
+                painter.restore()
+            painter.end()
+            icons.append(QIcon(pixmap))
+        return icons
+
+    def _task_loading_text(self, task: str) -> str:
+        return {
+            "whisper": "Downloading...",
+            "ollama": "Pulling...",
+            "dictionary": "Building...",
+            "spacy": "Installing...",
+            "blackhole": "Installing...",
+        }.get(task, "Working...")
+
+    def _set_asset_button_loading(self, task: str, asset_id: str) -> None:
+        key = (task, asset_id)
+        button = self._asset_buttons.get(key)
+        if button is None:
+            return
+        self._active_asset_tasks.add(key)
+        button.setEnabled(False)
+        button.setText(self._task_loading_text(task))
+        button.setIcon(self._spinner_icons[self._spinner_frame])
+        button.setIconSize(QSize(18, 18))
+        if not self._spinner_timer.isActive():
+            self._spinner_timer.start()
+
+    def _restore_asset_button(self, task: str, asset_id: str) -> None:
+        key = (task, asset_id)
+        self._active_asset_tasks.discard(key)
+        button = self._asset_buttons.get(key)
+        defaults = self._asset_button_defaults.get(key)
+        if button is not None and defaults is not None:
+            text, icon = defaults
+            button.setText(text)
+            button.setIcon(icon)
+            button.setEnabled(True)
+        if not self._active_asset_tasks:
+            self._spinner_timer.stop()
+
+    @Slot()
+    def _advance_spinner_icons(self) -> None:
+        if not self._active_asset_tasks:
+            self._spinner_timer.stop()
+            return
+        self._spinner_frame = (self._spinner_frame + 1) % len(self._spinner_icons)
+        icon = self._spinner_icons[self._spinner_frame]
+        for key in self._active_asset_tasks:
+            button = self._asset_buttons.get(key)
+            if button is not None:
+                button.setIcon(icon)
+
+    def _create_minutes_client(self) -> OllamaMinutesClient:
+        return OllamaMinutesClient(model=self._selected_minutes_model())
+
+    def _selected_minutes_model(self) -> str:
+        return str(self.settings.value("models/minutes", DEFAULT_MINUTES_MODEL))
+
+    def _selected_word_hints_model(self) -> str:
+        return str(self.settings.value("models/word_hints", DEFAULT_WORD_HINT_MODEL))
+
+    @Slot(str)
+    def _on_transcription_model_changed(self, model: str) -> None:
+        self.settings.setValue("models/transcription", model)
+        if self._selected_transcription_model_label is not None:
+            self._selected_transcription_model_label.setText(model)
+        status = whisper_model_status(model, self._app_data_dir)
+        if not status.installed:
+            self.set_status(f"{model} will download on first use, or use Settings to download it now.")
+        if self._model_use_buttons:
+            self._refresh_asset_statuses()
+
+    def _set_transcription_model(self, model: str) -> None:
+        self.model_combo.setCurrentText(model)
+        self.settings.setValue("models/transcription", model)
+        self._refresh_asset_statuses()
+
+    def _set_minutes_model(self, model: str) -> None:
+        self.settings.setValue("models/minutes", model)
+        self.set_status(f"Minutes model set to {model}")
+        self._refresh_asset_statuses()
+
+    def _set_word_hints_model(self, model: str) -> None:
+        self.settings.setValue("models/word_hints", model)
+        self.set_status(f"Word-hint model set to {model}")
+        self._refresh_asset_statuses()
+
+    @Slot()
+    def _refresh_asset_statuses(self) -> None:
+        whisper_statuses: dict[str, AssetStatus] = {}
+        for asset in WHISPER_MODELS:
+            status = whisper_model_status(asset.asset_id, self._app_data_dir)
+            whisper_statuses[asset.asset_id] = status
+            label = self._whisper_status_labels.get(asset.asset_id)
+            if label is None:
+                continue
+            self._apply_status_label(label, status)
+
+        ollama_names = ollama_model_names()
+        ollama_statuses: dict[str, AssetStatus] = {}
+        for asset in OLLAMA_MODELS:
+            status = ollama_status(asset.asset_id, ollama_names)
+            ollama_statuses[asset.asset_id] = status
+            label = self._ollama_status_labels.get(asset.asset_id)
+            if label is None:
+                continue
+            self._apply_status_label(label, status)
+
+        if self._spacy_status_label is not None:
+            self._apply_status_label(self._spacy_status_label, spacy_model_status())
+        if self._dictionary_status_label is not None:
+            self._apply_status_label(self._dictionary_status_label, dictionary_status(self._app_data_dir))
+        if self._blackhole_status_label is not None:
+            device_names = [self.device_combo.itemText(index) for index in range(self.device_combo.count())]
+            self._apply_status_label(self._blackhole_status_label, blackhole_status(device_names))
+
+        if self._selected_transcription_model_label is not None:
+            self._selected_transcription_model_label.setText(self.model_combo.currentText())
+        if self._selected_minutes_model_label is not None:
+            self._selected_minutes_model_label.setText(self._selected_minutes_model())
+        if self._selected_word_hints_model_label is not None:
+            self._selected_word_hints_model_label.setText(self._selected_word_hints_model())
+        self._refresh_model_use_buttons(whisper_statuses, ollama_statuses)
+
+    def _apply_status_label(self, label: QLabel, status: AssetStatus) -> None:
+        color = "#25714f" if status.installed else "#9a5a17"
+        text = html.escape(status.detail)
+        if status.path:
+            text += f"<br><span style='color:#697782'>{html.escape(status.path)}</span>"
+        label.setText(f"<span style='color:{color}; font-weight:700'>{text}</span>")
+
+    def _refresh_model_use_buttons(
+        self,
+        whisper_statuses: dict[str, AssetStatus],
+        ollama_statuses: dict[str, AssetStatus],
+    ) -> None:
+        selected_transcription = self.model_combo.currentText()
+        selected_minutes = self._selected_minutes_model()
+        selected_word_hints = self._selected_word_hints_model()
+
+        for asset in WHISPER_MODELS:
+            status = whisper_statuses.get(asset.asset_id)
+            self._set_model_use_button_state(
+                role="transcription",
+                model_id=asset.asset_id,
+                selected=asset.asset_id == selected_transcription,
+                installed=bool(status and status.installed),
+            )
+
+        for asset in OLLAMA_MODELS:
+            status = ollama_statuses.get(asset.asset_id)
+            installed = bool(status and status.installed)
+            self._set_model_use_button_state(
+                role="minutes",
+                model_id=asset.asset_id,
+                selected=asset.asset_id == selected_minutes,
+                installed=installed,
+            )
+            self._set_model_use_button_state(
+                role="word_hints",
+                model_id=asset.asset_id,
+                selected=asset.asset_id == selected_word_hints,
+                installed=installed,
+            )
+
+    def _set_model_use_button_state(
+        self,
+        role: str,
+        model_id: str,
+        selected: bool,
+        installed: bool,
+    ) -> None:
+        button = self._model_use_buttons.get((role, model_id))
+        if button is None:
+            return
+
+        button.setEnabled(installed and not selected)
+        if selected:
+            button.setToolTip("Already selected in Selected Defaults.")
+        elif not installed:
+            button.setToolTip("Download or pull this model before using it.")
+        else:
+            button.setToolTip("")
+
+    def _start_asset_task(self, task: str, asset_id: str) -> None:
+        key = (task, asset_id)
+        if key in self._active_asset_tasks:
+            return
+        if self._asset_status_label is not None:
+            self._asset_status_label.setText(f"Starting {asset_id}...")
+        if self._asset_progress is not None:
+            self._asset_progress.setValue(0)
+        self._set_asset_button_loading(task, asset_id)
+
+        thread = QThread(self)
+        worker = AssetInstallWorker(task, asset_id, self._app_data_dir)
+        worker.moveToThread(thread)
+        self._asset_threads.append((thread, worker))
+
+        thread.started.connect(worker.run)
+        worker.status.connect(self._on_asset_task_status)
+        worker.progress.connect(self._on_asset_task_progress)
+        worker.finished.connect(
+            lambda done_asset_id, task=task, asset_id=asset_id: self._on_asset_task_finished(
+                task,
+                asset_id,
+                done_asset_id,
+            )
+        )
+        worker.finished.connect(thread.quit)
+        worker.error.connect(
+            lambda message, task=task, asset_id=asset_id: self._on_asset_task_error(task, asset_id, message)
+        )
+        worker.error.connect(thread.quit)
+        thread.finished.connect(worker.deleteLater)
+        thread.finished.connect(thread.deleteLater)
+        thread.finished.connect(lambda task_thread=thread, task_worker=worker: self._cleanup_asset_thread(task_thread, task_worker))
+        thread.start()
+
+    @Slot(str)
+    def _on_asset_task_status(self, message: str) -> None:
+        if self._asset_status_label is not None:
+            self._asset_status_label.setText(message)
+
+    @Slot(int)
+    def _on_asset_task_progress(self, value: int) -> None:
+        if self._asset_progress is not None:
+            self._asset_progress.setValue(max(0, min(100, value)))
+
+    def _on_asset_task_finished(self, task: str, asset_id: str, done_asset_id: str) -> None:
+        self._restore_asset_button(task, asset_id)
+        if self._asset_status_label is not None:
+            self._asset_status_label.setText(f"Ready: {done_asset_id}")
+        if self._asset_progress is not None:
+            self._asset_progress.setValue(100)
+        self._refresh_asset_statuses()
+
+    def _on_asset_task_error(self, task: str, asset_id: str, message: str) -> None:
+        self._restore_asset_button(task, asset_id)
+        if self._asset_status_label is not None:
+            self._asset_status_label.setText(message)
+        QMessageBox.warning(self, "Live Transcriber Setup", message)
+        self._refresh_asset_statuses()
+
+    def _cleanup_asset_thread(self, thread: QThread, worker: AssetInstallWorker) -> None:
+        self._asset_threads = [
+            (task_thread, task_worker)
+            for task_thread, task_worker in self._asset_threads
+            if not (task_thread is thread and task_worker is worker)
+        ]
+
+    @Slot()
+    def _confirm_blackhole_install(self) -> None:
+        choice = QMessageBox.question(
+            self,
+            "Install BlackHole 2ch",
+            "Install BlackHole 2ch with Homebrew? You may need to restart audio apps afterwards.",
+            QMessageBox.StandardButton.Cancel | QMessageBox.StandardButton.Ok,
+            QMessageBox.StandardButton.Ok,
+        )
+        if choice == QMessageBox.StandardButton.Ok:
+            self._start_asset_task("blackhole", "blackhole-2ch")
+
+    @Slot()
+    def _open_app_data_dir(self) -> None:
+        self._app_data_dir.mkdir(parents=True, exist_ok=True)
+        if sys.platform == "darwin":
+            subprocess.Popen(["open", str(self._app_data_dir)])
+        else:
+            QMessageBox.information(self, "Live Transcriber", str(self._app_data_dir))
 
     @property
     def transcript(self) -> QTextEdit:
@@ -1030,10 +1743,12 @@ class MainWindow(QMainWindow):
             index = self.device_combo.findData(current_device)
             if index >= 0:
                 self.device_combo.setCurrentIndex(index)
+                self._refresh_asset_statuses()
                 return
 
         if blackhole_index is not None:
             self.device_combo.setCurrentIndex(blackhole_index)
+        self._refresh_asset_statuses()
 
     @Slot()
     def toggle_transcription(self) -> None:
@@ -1086,6 +1801,8 @@ class MainWindow(QMainWindow):
     @Slot(str)
     def set_status(self, message: str) -> None:
         self.status_label.setText(message)
+        if message == "Listening":
+            self._refresh_asset_statuses()
 
     @Slot(str)
     def show_error(self, message: str) -> None:
@@ -1107,6 +1824,7 @@ class MainWindow(QMainWindow):
     def _on_worker_finished(self, exit_code: int) -> None:
         if exit_code == 0:
             self.set_status("Idle")
+        self._refresh_asset_statuses()
         self._set_running(False)
         self._recording_document = None
         self._worker = None
@@ -1162,7 +1880,9 @@ class MainWindow(QMainWindow):
             full_translation=self.full_translation_check.isChecked(),
             selective_translation=self.selective_translation_check.isChecked(),
             selective_translation_backend="ollama",
+            word_hint_model=self._selected_word_hints_model(),
             translation_target_language=self.translation_target_combo.currentText(),
+            whisper_download_root=whisper_download_root(self._app_data_dir),
         )
 
     def _set_running(self, is_running: bool) -> None:
@@ -1397,6 +2117,8 @@ class MainWindow(QMainWindow):
 def main() -> int:
     app = QApplication(sys.argv)
     app.setApplicationName("Live Transcriber")
+    if APP_ICON_PATH.exists():
+        app.setWindowIcon(QIcon(str(APP_ICON_PATH)))
     window = MainWindow()
     window.show()
     return int(app.exec())

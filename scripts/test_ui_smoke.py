@@ -13,6 +13,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 from live_transcriber.device_utils import DeviceInfo
 
 import ui_app
+from live_transcriber.model_assets import AssetStatus
 
 
 class FakeWorker:
@@ -62,12 +63,18 @@ def wait_for(app: ui_app.QApplication, condition, timeout: float = 3.0) -> None:
 
 
 def main() -> None:
+    settings_dir = tempfile.TemporaryDirectory()
+    os.environ["LIVE_TRANSCRIBER_SETTINGS_FILE"] = str(Path(settings_dir.name) / "settings.ini")
     app = ui_app.QApplication.instance() or ui_app.QApplication([])
     ui_app.get_input_devices = lambda: [DeviceInfo(0, "BlackHole 2ch", 2, 48000.0)]
 
     minutes_calls: list[tuple[str, int]] = []
     window = ui_app.MainWindow(minutes_client_factory=lambda: FakeMinutesClient(minutes_calls))
     assert window.start_button.text() == "Start"
+    assert not window.windowIcon().isNull()
+    assert window.app_tabs.count() == 2
+    assert window.app_tabs.tabText(0) == "Live"
+    assert window.app_tabs.tabText(1) == "Settings"
     assert window.tabs.count() == 1
     assert window._current_document().splitter.count() == 3
     assert window.device_combo.currentData() == 0
@@ -84,7 +91,59 @@ def main() -> None:
     assert config.full_translation is True
     assert config.selective_translation is True
     assert config.selective_translation_backend == "ollama"
+    assert config.word_hint_model
+    assert config.whisper_download_root == ui_app.whisper_download_root(window._app_data_dir)
     assert config.translation_target_language == "en"
+
+    window._refresh_model_use_buttons(
+        whisper_statuses={
+            "base": AssetStatus("base", True, "Ready in app cache"),
+            "small": AssetStatus("small", True, "Ready in app cache"),
+            "medium": AssetStatus("medium", False, "Not downloaded"),
+        },
+        ollama_statuses={
+            "llama3.1:latest": AssetStatus("llama3.1:latest", True, "Available"),
+            "llama3.2:3b": AssetStatus("llama3.2:3b", True, "Available"),
+            "mistral:7b": AssetStatus("mistral:7b", False, "Not pulled"),
+        },
+    )
+    assert not window._model_use_buttons[("transcription", "base")].isEnabled()
+    assert window._model_use_buttons[("transcription", "small")].isEnabled()
+    assert not window._model_use_buttons[("transcription", "medium")].isEnabled()
+    assert not window._model_use_buttons[("minutes", "llama3.1:latest")].isEnabled()
+    assert window._model_use_buttons[("minutes", "llama3.2:3b")].isEnabled()
+    assert not window._model_use_buttons[("word_hints", "mistral:7b")].isEnabled()
+
+    task_key = ("whisper", "base")
+    task_button = window._asset_buttons[task_key]
+    assert task_button.text() == "Download"
+    window._set_asset_button_loading(*task_key)
+    assert not task_button.isEnabled()
+    assert task_button.text() == "Downloading..."
+    assert not task_button.icon().isNull()
+    window._advance_spinner_icons()
+    window._restore_asset_button(*task_key)
+    assert task_button.isEnabled()
+    assert task_button.text() == "Download"
+
+    with tempfile.TemporaryDirectory() as temp_dir:
+        spacy_worker = ui_app.AssetInstallWorker("spacy", "de_core_news_sm", Path(temp_dir))
+        commands: list[list[str]] = []
+        spacy_worker._run_subprocess = lambda command: commands.append(command)  # type: ignore[method-assign]
+        spacy_worker._install_spacy()
+        assert commands == [
+            [sys.executable, "-m", "pip", "install", "spacy"],
+            [sys.executable, "-m", "spacy", "download", "de_core_news_sm"],
+        ]
+
+    window._set_transcription_model("small")
+    assert window.model_combo.currentText() == "small"
+    assert window.settings.value("models/transcription") == "small"
+    window._set_minutes_model("llama3.2:3b")
+    assert window._selected_minutes_model() == "llama3.2:3b"
+    window._set_word_hints_model("mistral:7b")
+    assert window._selected_word_hints_model() == "mistral:7b"
+    window._set_transcription_model("base")
 
     window._set_running(True)
     assert window.start_button.text() == "Stop"
@@ -211,6 +270,8 @@ def main() -> None:
 
     window.close()
     app.quit()
+    os.environ.pop("LIVE_TRANSCRIBER_SETTINGS_FILE", None)
+    settings_dir.cleanup()
     print("ui smoke tests passed")
 
 

@@ -129,6 +129,6 @@ def format_minutes_events(events: list[dict[str, Any]]) -> str:
 def _ollama_error_message(message: str, model: str) -> str:
     normalized = message.casefold()
     if "not found" in normalized or "pull" in normalized or ("model" in normalized and "missing" in normalized):
-        model_name = model.split(":", 1)[0]
+        model_name = model.removesuffix(":latest")
         return f"Model {model} is missing. Install it with: ollama pull {model_name}"
     return message.strip() or "Ollama minutes update failed."

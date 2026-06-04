@@ -87,6 +87,7 @@ class LiveTranscriberCallbacks:
     on_status: Callable[[str], None] | None = None
     on_partial_text: Callable[[str], None] | None = None
     on_final_text: Callable[[str, dict[str, Any]], None] | None = None
+    on_audio_level: Callable[[float, bool, str], None] | None = None
     on_error: Callable[[str], None] | None = None
 
 
@@ -181,6 +182,7 @@ class LiveTranscriberSession:
             self._speaker_labeler = speaker_labeler
 
         from live_transcriber.deduper import RecentTextDeduper
+        from live_transcriber.audio import audio_signal_level
         from live_transcriber.jobs import TranscriptionJob, TranscriptionJobQueue
         from live_transcriber.partials import PartialTextTracker
         from live_transcriber.segmentation import SpeechSegmenter
@@ -377,6 +379,9 @@ class LiveTranscriberSession:
                         continue
                     if frame.status:
                         logger.debug("Audio callback status: %s", frame.status)
+                    if callbacks.on_audio_level is not None:
+                        level, active = audio_signal_level(frame.audio)
+                        callbacks.on_audio_level(level, active, frame.status or "")
 
                     for segment in segmenter.process(frame.audio):
                         enqueue_final(segment)

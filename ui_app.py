@@ -4,14 +4,18 @@ import html
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
+import time
 import unicodedata
 from dataclasses import dataclass, field
 from pathlib import Path
+from threading import Event
 from typing import Any, Callable
 from urllib import error, request
 
+from live_transcriber.audio import audio_signal_level
 from live_transcriber.config import (
     DEFAULT_BEAM_SIZE,
     DEFAULT_JSONL_OUTPUT,
@@ -108,6 +112,7 @@ class TranscriptionWorker(QObject):
     status_changed = Signal(str)
     partial_text = Signal(str)
     final_text = Signal(str, object)
+    audio_level = Signal(float, bool, str)
     error = Signal(str)
     finished = Signal(int)
 
@@ -127,6 +132,7 @@ class TranscriptionWorker(QObject):
             on_status=self.status_changed.emit,
             on_partial_text=self.partial_text.emit,
             on_final_text=lambda text, record: self.final_text.emit(text, record),
+            on_audio_level=self.audio_level.emit,
             on_error=self.error.emit,
         )
         exit_code = self._session.run_blocking(self._config, callbacks)
@@ -247,9 +253,14 @@ class AssetInstallWorker(QObject):
                     if isinstance(completed, int) and isinstance(total, int) and total > 0:
                         self.progress.emit(max(0, min(100, int(completed * 100 / total))))
         except error.URLError as exc:
-            raise RuntimeError("Ollama is not running. Start it with: ollama serve") from exc
+            if shutil.which("ollama") is None:
+                raise RuntimeError(
+                    "Ollama is not installed or is not on PATH. Install it from https://ollama.com/download "
+                    "or with: brew install ollama"
+                ) from exc
+            raise RuntimeError("Ollama is not running. Start the Ollama app or run: ollama serve") from exc
         except TimeoutError as exc:
-            raise RuntimeError("Timed out connecting to Ollama. Start it with: ollama serve") from exc
+            raise RuntimeError("Timed out connecting to Ollama. Start the Ollama app or run: ollama serve") from exc
         self.progress.emit(100)
         self.status.emit(f"Ollama model ready: {self._asset_id}")
 
@@ -318,7 +329,122 @@ class AssetInstallWorker(QObject):
         return "\n".join(parts)
 
 
+class AudioProbeWorker(QObject):
+    level_changed = Signal(float, bool, str)
+    error = Signal(str)
+    finished = Signal()
+
+    def __init__(self, device: int | None, sample_rate: int = 16000) -> None:
+        super().__init__()
+        self._device = device
+        self._sample_rate = int(sample_rate)
+        self._stop_event = Event()
+        self._stream = None
+
+    @Slot()
+    def run(self) -> None:
+        try:
+            import sounddevice as sd
+        except ModuleNotFoundError:
+            self.error.emit("Input meter unavailable: sounddevice is not installed")
+            self.finished.emit()
+            return
+
+        last_emit_at = 0.0
+
+        def callback(indata, frames, time_info, status) -> None:  # noqa: ANN001
+            del frames, time_info
+            nonlocal last_emit_at
+            now = time.monotonic()
+            if now - last_emit_at < 0.08:
+                return
+            last_emit_at = now
+            level, active = audio_signal_level(indata)
+            self.level_changed.emit(level, active, str(status) if status else "")
+
+        try:
+            self._stream = sd.InputStream(
+                samplerate=self._sample_rate,
+                channels=1,
+                dtype="float32",
+                device=self._device,
+                blocksize=max(1, int(self._sample_rate * 0.08)),
+                callback=callback,
+            )
+            self._stream.start()
+            while not self._stop_event.wait(0.1):
+                pass
+        except Exception as exc:  # noqa: BLE001
+            self.error.emit(f"Input meter unavailable: {exc}")
+        finally:
+            if self._stream is not None:
+                try:
+                    self._stream.stop()
+                    self._stream.close()
+                except Exception:
+                    pass
+                self._stream = None
+            self.finished.emit()
+
+    @Slot()
+    def stop(self) -> None:
+        self._stop_event.set()
+
+
+class AudioLevelBar(QWidget):
+    def __init__(self) -> None:
+        super().__init__()
+        self._level = 0.0
+        self._active = False
+        self.setMinimumWidth(180)
+        self.setFixedHeight(32)
+        self.setToolTip("Shows whether the selected input device is receiving audio.")
+
+    def set_level(self, level: float, active: bool) -> None:
+        self._level = max(0.0, min(1.0, float(level)))
+        self._active = bool(active)
+        self.update()
+
+    def paintEvent(self, event) -> None:  # noqa: ANN001
+        del event
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+
+        rect = self.rect().adjusted(1, 4, -1, -4)
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(QColor("#edf3f4"))
+        painter.drawRoundedRect(rect, 8, 8)
+
+        bars = 22
+        gap = 3
+        available_width = max(1, rect.width() - gap * (bars + 1))
+        bar_width = max(2, available_width / bars)
+        active_bars = int(round(self._level * bars))
+        center_y = rect.center().y()
+        max_height = max(6, rect.height() - 8)
+
+        for index in range(bars):
+            envelope = 0.25 + 0.75 * abs((index - (bars - 1) / 2) / ((bars - 1) / 2))
+            envelope = 1.0 - min(0.72, envelope * 0.46)
+            live_strength = self._level if self._active else min(self._level, 0.2)
+            height = max(4, int(max_height * (0.16 + live_strength * envelope)))
+            x = rect.left() + gap + index * (bar_width + gap)
+            y = int(center_y - height / 2)
+
+            if self._active and index < active_bars:
+                color = QColor("#1f7f78" if self._level < 0.78 else "#bf7a14")
+            else:
+                color = QColor("#c9d5d8")
+            painter.setBrush(color)
+            painter.drawRoundedRect(int(x), y, int(bar_width), height, 2, 2)
+
+        painter.end()
+
+
 class MainWindow(QMainWindow):
+    asset_task_finished = Signal(str, str, str)
+    asset_task_failed = Signal(str, str, str)
+
     def __init__(self, minutes_client_factory: Callable[[], OllamaMinutesClient] | None = None) -> None:
         super().__init__()
         self.setWindowTitle("Live Transcriber")
@@ -350,6 +476,12 @@ class MainWindow(QMainWindow):
         self._minutes_document: TranscriptDocument | None = None
         self._minutes_client_factory = minutes_client_factory or self._create_minutes_client
         self._is_running = False
+        self._audio_probe_thread: QThread | None = None
+        self._audio_probe_worker: AudioProbeWorker | None = None
+        self._audio_probe_enabled = (
+            os.environ.get("LIVE_TRANSCRIBER_DISABLE_AUDIO_PROBE") != "1"
+            and os.environ.get("QT_QPA_PLATFORM") != "offscreen"
+        )
         self._documents: dict[QWidget, TranscriptDocument] = {}
         self._recording_document: TranscriptDocument | None = None
         self._untitled_count = 0
@@ -374,6 +506,9 @@ class MainWindow(QMainWindow):
         self._selected_minutes_model_label: QLabel | None = None
         self._selected_word_hints_model_label: QLabel | None = None
 
+        self.asset_task_finished.connect(self._on_asset_task_finished, Qt.ConnectionType.QueuedConnection)
+        self.asset_task_failed.connect(self._on_asset_task_error, Qt.ConnectionType.QueuedConnection)
+
         self._build_ui()
         self.new_transcript()
         self.refresh_devices()
@@ -396,6 +531,7 @@ class MainWindow(QMainWindow):
 
         self.device_combo = QComboBox()
         self.device_combo.setMinimumWidth(320)
+        self.device_combo.currentIndexChanged.connect(self._on_input_device_changed)
         top_row.addWidget(QLabel("Input"))
         top_row.addWidget(self.device_combo, stretch=1)
 
@@ -403,6 +539,19 @@ class MainWindow(QMainWindow):
         self.refresh_button.clicked.connect(self.refresh_devices)
         top_row.addWidget(self.refresh_button)
         layout.addLayout(top_row)
+
+        meter_row = QHBoxLayout()
+        meter_row.setSpacing(10)
+        meter_label = QLabel("Signal")
+        meter_label.setStyleSheet("color: #52616d; font-weight: 700;")
+        meter_row.addWidget(meter_label)
+        self.audio_level_bar = AudioLevelBar()
+        meter_row.addWidget(self.audio_level_bar, stretch=1)
+        self.audio_signal_label = QLabel("Checking input...")
+        self.audio_signal_label.setMinimumWidth(155)
+        self.audio_signal_label.setStyleSheet("color: #60707a;")
+        meter_row.addWidget(self.audio_signal_label)
+        layout.addLayout(meter_row)
 
         options_grid = QGridLayout()
         options_grid.setHorizontalSpacing(16)
@@ -970,7 +1119,7 @@ class MainWindow(QMainWindow):
         worker.status.connect(self._on_asset_task_status)
         worker.progress.connect(self._on_asset_task_progress)
         worker.finished.connect(
-            lambda done_asset_id, task=task, asset_id=asset_id: self._on_asset_task_finished(
+            lambda done_asset_id, task=task, asset_id=asset_id: self.asset_task_finished.emit(
                 task,
                 asset_id,
                 done_asset_id,
@@ -978,7 +1127,7 @@ class MainWindow(QMainWindow):
         )
         worker.finished.connect(thread.quit)
         worker.error.connect(
-            lambda message, task=task, asset_id=asset_id: self._on_asset_task_error(task, asset_id, message)
+            lambda message, task=task, asset_id=asset_id: self.asset_task_failed.emit(task, asset_id, message)
         )
         worker.error.connect(thread.quit)
         thread.finished.connect(worker.deleteLater)
@@ -996,6 +1145,7 @@ class MainWindow(QMainWindow):
         if self._asset_progress is not None:
             self._asset_progress.setValue(max(0, min(100, value)))
 
+    @Slot(str, str, str)
     def _on_asset_task_finished(self, task: str, asset_id: str, done_asset_id: str) -> None:
         self._restore_asset_button(task, asset_id)
         if self._asset_status_label is not None:
@@ -1004,6 +1154,7 @@ class MainWindow(QMainWindow):
             self._asset_progress.setValue(100)
         self._refresh_asset_statuses()
 
+    @Slot(str, str, str)
     def _on_asset_task_error(self, task: str, asset_id: str, message: str) -> None:
         self._restore_asset_button(task, asset_id)
         if self._asset_status_label is not None:
@@ -1721,18 +1872,100 @@ class MainWindow(QMainWindow):
             """
 
     @Slot()
+    def _on_input_device_changed(self) -> None:
+        if self._blackhole_status_label is not None:
+            self._refresh_asset_statuses()
+        if not self._is_running:
+            self._restart_audio_probe()
+
+    def _restart_audio_probe(self) -> None:
+        self._stop_audio_probe()
+        self._set_audio_meter_state(0.0, False, "Checking input...")
+        if not self._audio_probe_enabled or self._is_running:
+            if not self._audio_probe_enabled:
+                self._set_audio_meter_state(0.0, False, "Meter unavailable")
+            return
+
+        thread = QThread(self)
+        worker = AudioProbeWorker(device=self.device_combo.currentData())
+        worker.moveToThread(thread)
+        self._audio_probe_thread = thread
+        self._audio_probe_worker = worker
+
+        thread.started.connect(worker.run)
+        worker.level_changed.connect(self.update_audio_level)
+        worker.error.connect(self._on_audio_probe_error)
+        worker.finished.connect(thread.quit)
+        thread.finished.connect(worker.deleteLater)
+        thread.finished.connect(thread.deleteLater)
+        thread.finished.connect(
+            lambda probe_thread=thread, probe_worker=worker: self._cleanup_audio_probe(probe_thread, probe_worker)
+        )
+        thread.start()
+
+    def _stop_audio_probe(self) -> None:
+        worker = self._audio_probe_worker
+        thread = self._audio_probe_thread
+        if worker is not None:
+            worker.stop()
+        if thread is not None and thread.isRunning():
+            thread.quit()
+            thread.wait(1000)
+        self._audio_probe_worker = None
+        self._audio_probe_thread = None
+
+    def _cleanup_audio_probe(self, thread: QThread, worker: AudioProbeWorker) -> None:
+        if self._audio_probe_thread is thread and self._audio_probe_worker is worker:
+            self._audio_probe_thread = None
+            self._audio_probe_worker = None
+
+    @Slot(float, bool, str)
+    def update_audio_level(self, level: float, active: bool, status: str = "") -> None:
+        if status:
+            label = "Input warning"
+            color = "#9a5a17"
+        elif active:
+            label = "Streaming audio"
+            color = "#24745d"
+        elif level > 0.08:
+            label = "Low signal"
+            color = "#64737c"
+        else:
+            label = "No signal"
+            color = "#7a8790"
+        self._set_audio_meter_state(level, active, label, color=color)
+
+    @Slot(str)
+    def _on_audio_probe_error(self, message: str) -> None:
+        self._set_audio_meter_state(0.0, False, message, color="#9a5a17")
+
+    def _set_audio_meter_state(
+        self,
+        level: float,
+        active: bool,
+        label: str,
+        color: str = "#60707a",
+    ) -> None:
+        self.audio_level_bar.set_level(level, active)
+        self.audio_signal_label.setText(html.escape(label))
+        self.audio_signal_label.setStyleSheet(f"color: {color}; font-weight: 700;")
+
+    @Slot()
     def refresh_devices(self) -> None:
         current_device = self.device_combo.currentData()
+        signals_were_blocked = self.device_combo.blockSignals(True)
         self.device_combo.clear()
         self.device_combo.addItem("System Default Input", None)
 
         try:
             devices = get_input_devices()
         except RuntimeError as exc:
+            self.device_combo.blockSignals(signals_were_blocked)
             self.set_status(str(exc))
             return
 
         blackhole_index: int | None = None
+        selected_index: int | None = None
         for device in devices:
             label = self._device_label(device)
             self.device_combo.addItem(label, device.id)
@@ -1742,13 +1975,16 @@ class MainWindow(QMainWindow):
         if current_device is not None:
             index = self.device_combo.findData(current_device)
             if index >= 0:
-                self.device_combo.setCurrentIndex(index)
-                self._refresh_asset_statuses()
-                return
+                selected_index = index
 
-        if blackhole_index is not None:
-            self.device_combo.setCurrentIndex(blackhole_index)
+        if selected_index is None and blackhole_index is not None:
+            selected_index = blackhole_index
+        if selected_index is not None:
+            self.device_combo.setCurrentIndex(selected_index)
+        self.device_combo.blockSignals(signals_were_blocked)
         self._refresh_asset_statuses()
+        if not self._is_running:
+            self._restart_audio_probe()
 
     @Slot()
     def toggle_transcription(self) -> None:
@@ -1758,6 +1994,8 @@ class MainWindow(QMainWindow):
             self.start_transcription()
 
     def start_transcription(self) -> None:
+        self._stop_audio_probe()
+        self._set_audio_meter_state(0.0, False, "Listening...")
         config = self._build_config()
         document = self._current_document()
         self._recording_document = document
@@ -1784,6 +2022,7 @@ class MainWindow(QMainWindow):
         self._worker.status_changed.connect(self.set_status)
         self._worker.partial_text.connect(self.append_partial)
         self._worker.final_text.connect(self.append_final)
+        self._worker.audio_level.connect(self.update_audio_level)
         self._worker.error.connect(self.show_error)
         self._worker.finished.connect(self._on_worker_finished)
         self._worker.finished.connect(self._thread.quit)
@@ -1794,6 +2033,7 @@ class MainWindow(QMainWindow):
 
     def stop_transcription(self) -> None:
         self.set_status("Stopping")
+        self._set_audio_meter_state(0.0, False, "Stopping...")
         if self._worker is not None:
             self._worker.stop()
         self.start_button.setEnabled(False)
@@ -1829,6 +2069,7 @@ class MainWindow(QMainWindow):
         self._recording_document = None
         self._worker = None
         self._thread = None
+        self._restart_audio_probe()
 
     def set_always_on_top(self, enabled: bool) -> None:
         self.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint, enabled)
@@ -1852,8 +2093,11 @@ class MainWindow(QMainWindow):
                     return
         for document in list(self._documents.values()):
             if not self._confirm_close_document(document):
+                if not self._is_running:
+                    self._restart_audio_probe()
                 event.ignore()
                 return
+        self._stop_audio_probe()
         super().closeEvent(event)
 
     def _build_config(self) -> LiveTranscriberConfig:

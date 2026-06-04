@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from queue import Empty, Queue
 
@@ -12,6 +13,18 @@ class AudioFrame:
 
     audio: np.ndarray
     status: str | None = None
+
+
+def audio_signal_level(audio: np.ndarray, active_threshold: float = 0.008) -> tuple[float, bool]:
+    """Return a display-friendly 0..1 audio level and whether it looks active."""
+    audio = np.asarray(audio, dtype=np.float32).reshape(-1)
+    if audio.size == 0:
+        return 0.0, False
+
+    rms = float(np.sqrt(np.mean(np.square(np.clip(audio, -1.0, 1.0)))))
+    db = 20.0 * math.log10(max(rms, 1e-9))
+    level = max(0.0, min(1.0, (db + 60.0) / 54.0))
+    return level, rms >= active_threshold
 
 
 class AudioRecorder:
